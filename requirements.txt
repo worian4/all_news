@@ -1,5 +1,0 @@
-aiogram==3.0.0b7
-telethon==1.28.5
-sentence-transformers==2.2.2
-aiofiles==23.1.0
-setuptools==80.9.0
