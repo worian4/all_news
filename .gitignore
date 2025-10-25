@@ -1,2 +1,8 @@
 tg_config.json
 test.py
+data
+news_bot_session.session
+news_bot_session.session-journal
+news_monitor_session.session
+user_monitor_session.session
+test.py

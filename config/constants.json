@@ -1,0 +1,8 @@
+{
+    "queue_ttl_seconds": 1800,
+    "archive_ttl_days": 7,
+    "queue_processing_interval": 300,
+    "archive_cleanup_interval": 86400,
+    "max_posts_per_batch": 5,
+    "similarity_threshold": 0.85
+}

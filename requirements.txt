@@ -1,0 +1,10 @@
+python-telegram-bot==20.7
+telethon==1.28.5
+aiofiles==23.2.1
+torch>=2.0.0
+transformers>=4.36.0
+sentence-transformers>=2.2.2
+scikit-learn>=1.2.0
+numpy>=1.24.3
+requests>=2.28.0
+huggingface-hub>=0.16.4
