@@ -1,0 +1,6 @@
+{
+"period_check": 300,
+"queue_timeout": 1800,
+"archive_cleanup": 604800,
+"similarity_threshold": 0.8
+}
