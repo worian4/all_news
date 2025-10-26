@@ -6,6 +6,7 @@
 import asyncio
 import json
 from telethon import TelegramClient
+import os
 
 async def setup_monitor():
     """Настройка пользовательского аккаунта для мониторинга"""
@@ -21,8 +22,9 @@ async def setup_monitor():
     print("Этот шаг необходим для мониторинга Telegram каналов.")
     print("Вам нужно будет войти в ваш Telegram аккаунт.")
     print("=" * 50)
-    
-    client = TelegramClient('user_monitor_session', api_id, api_hash)
+
+    os.makedirs('session', exist_ok=True)
+    client = TelegramClient('session/user_monitor_session', api_id, api_hash)
     
     try:
         await client.start()

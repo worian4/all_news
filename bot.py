@@ -196,8 +196,10 @@ class ChannelMonitor:
             
             logger.info("🔄 Запуск мониторинга каналов...")
             
+            os.makedirs('session', exist_ok=True)
+
             self.telethon_client = TelegramClient(
-                'user_monitor_session', 
+                'session/user_monitor_session', 
                 self.api_id, 
                 self.api_hash
             )
@@ -578,7 +580,7 @@ class NewsBot:
         await self.create_user_files(user_id)
         
         welcome_text = """
-🤖 Добро пожаловать в NewsAggregatorBot!
+🤖 Добро пожаловать в All News Bot!
 
 🎯 **Включено детальное логирование:**
 • 📨 Логирование всех постов из каналов
@@ -666,9 +668,9 @@ class NewsBot:
 • 📊 Статус добавления в очередь
 
 💡 **Формат каналов:**
-t.me/channel_name
-@username
-https://t.me/channel
+t.me/*channel_name*
+@*username*
+https://t.me/*channel*
         """
         
         await update.message.reply_text(
@@ -1014,22 +1016,11 @@ https://t.me/channel
             
             logger.info(f"📨 Отправка подборки пользователю {user_id}: {len(top_posts)} постов")
             
-            await self.application.bot.send_message(
-                chat_id=user_id,
-                text=f"📰 Новая подборка новостей ({len(top_posts)} из {len(posts)})",
-                reply_markup=self.get_main_keyboard()
-            )
-            
             for i, post in enumerate(top_posts, 1):
                 try:
                     logger.info(f"   📤 Отправка поста {i}/{len(top_posts)}: {post.get('channel')}")
                     
-                    # Пытаемся переслать оригинальное сообщение
-                    if self.channel_monitor.telethon_client and self.channel_monitor.telethon_client.is_connected():
-                        await self.forward_original_message(user_id, post, i)
-                    else:
-                        # Fallback: отправляем текстовое сообщение
-                        await self.send_text_message(user_id, post, i)
+                    await self.send_text_message(user_id, post, i)
                         
                 except Exception as e:
                     logger.error(f"Error sending message to user {user_id}: {e}")
@@ -1041,49 +1032,13 @@ https://t.me/channel
         except Exception as e:
             logger.error(f"Error in send_posts_to_user for {user_id}: {e}")
     
-    async def forward_original_message(self, user_id, post, index):
-        """Пересылка оригинального сообщения из канала"""
-        try:
-            from telethon.tl.types import InputPeerChannel
-            
-            # Получаем информацию о канале
-            channel_entity = await self.channel_monitor.telethon_client.get_entity(post['channel_id'])
-            
-            # Пересылаем сообщение
-            await self.channel_monitor.telethon_client.forward_messages(
-                entity=user_id,
-                messages=post['message_id'],
-                from_peer=channel_entity
-            )
-            
-            # Отправляем рейтинг отдельным сообщением
-            score = post.get('interest_score', 0.5)
-            stars = "⭐" * int(score * 5) + "☆" * (5 - int(score * 5))
-            
-            await self.application.bot.send_message(
-                chat_id=user_id,
-                text=f"#{index} Рейтинг: {stars} ({score:.2f}/1.0)",
-                reply_to_message_id=None
-            )
-            
-            await asyncio.sleep(1)  # Задержка между сообщениями
-            
-        except Exception as e:
-            logger.error(f"Error forwarding message for user {user_id}: {e}")
-            raise
-    
     async def send_text_message(self, user_id, post, index):
         """Отправка текстового сообщения (fallback)"""
-        text_preview = post['text'][:600] + "..." if len(post['text']) > 600 else post['text']
-        score = post.get('interest_score', 0.5)
-        stars = "⭐" * int(score * 5) + "☆" * (5 - int(score * 5))
         
         message = f"""
-#{index} {post.get('channel', 'Channel')} {stars}
+@{post.get('channel', 'Channel')}\t{post.get('url', '')}
 
-{text_preview}
-
-📖 Читать полностью: {post.get('url', '')}
+{post['text']}
         """.strip()
         
         await self.application.bot.send_message(
