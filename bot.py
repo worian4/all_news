@@ -1033,20 +1033,35 @@ https://t.me/*channel*
             logger.error(f"Error in send_posts_to_user for {user_id}: {e}")
     
     async def send_text_message(self, user_id, post, index):
-        """Отправка текстового сообщения (fallback)"""
-        
-        message = f"""
-@{post.get('channel', 'Channel')}\t{post.get('url', '')}
-
-{post['text']}
-        """.strip()
-        
-        await self.application.bot.send_message(
-            chat_id=user_id,
-            text=message,
-            disable_web_page_preview=False
-        )
-        await asyncio.sleep(1)
+        """Отправка текстового сообщения с правильным форматированием ссылки"""
+        try:
+            # Форматируем сообщение: ссылка на канал и пост сверху, затем текст
+            channel_name = post.get('channel', 'Unknown').lstrip('@')
+            post_url = post.get('url', '')
+            
+            # Создаем сообщение с ссылкой в формате [Channel Name](url)
+            message = f"**[{channel_name}]({post_url})**\n\n{post['text']}"
+            
+            await self.application.bot.send_message(
+                chat_id=user_id,
+                text=message,
+                parse_mode='Markdown',
+                disable_web_page_preview=False
+            )
+            await asyncio.sleep(1)
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки сообщения пользователю {user_id}: {e}")
+            # Fallback: отправка без Markdown форматирования
+            try:
+                fallback_message = f"{post.get('channel', 'Channel')} - {post.get('url', '')}\n\n{post['text']}"
+                await self.application.bot.send_message(
+                    chat_id=user_id,
+                    text=fallback_message,
+                    disable_web_page_preview=False
+                )
+            except Exception as fallback_error:
+                logger.error(f"❌ Fallback отправка также не удалась: {fallback_error}")
     
     async def update_user_stats(self, user_id, stat_type):
         """Обновление статистики"""
@@ -1107,6 +1122,40 @@ https://t.me/*channel*
                 logger.error(f"Error cleaning archive: {e}")
                 await asyncio.sleep(3600)
     
+    async def restore_channel_monitoring(self):
+        """Восстановление отслеживания каналов после перезагрузки бота"""
+        try:
+            logger.info("🔄 Восстанавливаю отслеживание каналов для всех пользователей...")
+            
+            if not os.path.exists('data/users'):
+                logger.info("📁 Нет данных пользователей для восстановления")
+                return
+                
+            users_folders = os.listdir('data/users')
+            total_channels = 0
+            
+            for user_folder in users_folders:
+                try:
+                    user_id = user_folder
+                    user_data_path = f"data/users/{user_id}/user_data.json"
+                    
+                    user_data = await self.channel_monitor._safe_json_load(user_data_path)
+                    if user_data and user_data.get('channels'):
+                        channels = user_data['channels']
+                        if channels:
+                            await self.channel_monitor.add_user_channels(user_id, channels)
+                            total_channels += len(channels)
+                            logger.info(f"   ✅ Восстановлено {len(channels)} каналов для пользователя {user_id}")
+                            
+                except Exception as e:
+                    logger.error(f"❌ Ошибка восстановления каналов для пользователя {user_folder}: {e}")
+                    continue
+                    
+            logger.info(f"✅ Восстановление завершено: {total_channels} каналов для {len(users_folders)} пользователей")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка при восстановлении отслеживания каналов: {e}")
+    
     async def shutdown(self):
         """Завершение работы"""
         logger.info("Завершение работы бота...")
@@ -1139,6 +1188,10 @@ https://t.me/*channel*
             try:
                 await self.channel_monitor.start()
                 logger.info("🎯 Мониторинг каналов: АКТИВЕН")
+                
+                # ВОССТАНОВЛЕНИЕ ОТСЛЕЖИВАНИЯ КАНАЛОВ ПОСЛЕ ПЕРЕЗАГРУЗКИ
+                await self.restore_channel_monitoring()
+                
                 logger.info("📨 Режим пересылки сообщений: ВКЛЮЧЕН")
                 logger.info("🔍 Детальное логирование: ВКЛЮЧЕНО")
             except Exception as e:
