@@ -3,3 +3,5 @@ test.py
 data
 session
 test.py
+reference.py
+config/channel_config.json

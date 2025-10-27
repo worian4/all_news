@@ -5,9 +5,10 @@ import re
 import aiofiles
 import numpy as np
 from datetime import datetime, timedelta
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from telegram.error import TelegramError
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.error import TelegramError, NetworkError
 import torch
 from transformers import pipeline
 from sentence_transformers import SentenceTransformer, util
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Уменьшаем логи внешних библиотек
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
-logging.getLogger("telethon").setLevel(logging.INFO)  # Оставляем INFO для Telethon чтобы видеть события
+logging.getLogger("telethon").setLevel(logging.INFO)
 
 # Настройка GPU для нейросетей
 def setup_gpu():
@@ -36,8 +37,6 @@ def setup_gpu():
             device = torch.device("cuda")
             gpu_name = torch.cuda.get_device_name(0)
             logger.info(f"🎮 Используется GPU: {gpu_name}")
-            logger.info(f"🎮 CUDA версия: {torch.version.cuda}")
-            logger.info(f"🎮 Память GPU: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
         else:
             device = torch.device("cpu")
             logger.info("❌ GPU не доступен, используется CPU")
@@ -56,7 +55,12 @@ def load_config():
             tg_config = json.load(f)
         with open('config/constants.json', 'r') as f:
             constants = json.load(f)
-        return tg_config, constants
+        
+        # Загрузка конфигурации приватного канала-посредника
+        with open('config/channel_config.json', 'r') as f:
+            channel_config = json.load(f)
+            
+        return tg_config, constants, channel_config
     except Exception as e:
         logger.error(f"Error loading config: {e}")
         default_constants = {
@@ -67,9 +71,12 @@ def load_config():
             "max_posts_per_batch": 5,
             "similarity_threshold": 0.85
         }
-        return {}, default_constants
+        default_channel_config = {
+            "channel_id": -1001234567890
+        }
+        return {}, default_constants, default_channel_config
 
-TG_CONFIG, CONSTANTS = load_config()
+TG_CONFIG, CONSTANTS, CHANNEL_CONFIG = load_config()
 
 class NeuralNewsProcessor:
     def __init__(self):
@@ -161,20 +168,9 @@ class NeuralNewsProcessor:
             
         return min(score, 1.0)
 
-    def are_posts_similar(self, fingerprint1, fingerprint2, text1, text2):
+    def are_posts_similar(self, fingerprint1, fingerprint2):
         """Проверка схожести двух постов"""
-        if fingerprint1 == fingerprint2:
-            return True
-            
-        try:
-            # Используем GPU для вычисления схожести
-            emb1 = self.embedding_model.encode(text1, convert_to_tensor=True)
-            emb2 = self.embedding_model.encode(text2, convert_to_tensor=True)
-            similarity = util.pytorch_cos_sim(emb1, emb2).item()
-            return similarity > CONSTANTS['similarity_threshold']
-        except Exception as e:
-            logger.error(f"Error checking similarity: {e}")
-            return False
+        return fingerprint1 == fingerprint2
 
 class ChannelMonitor:
     """Мониторинг каналов через пользовательский аккаунт"""
@@ -186,13 +182,15 @@ class ChannelMonitor:
         self.bot_application = bot_application
         self.telethon_client = None
         self.is_running = False
-        self.user_handlers = {}
+        self.channel_handlers = {}
         self.monitored_channels = set()
+        self.intermediate_channel_id = CHANNEL_CONFIG.get("channel_id")
+        self.intermediate_channel_title = "Приватный канал-посредник"
         
     async def start(self):
         """Запуск мониторинга"""
         try:
-            from telethon import TelegramClient
+            from telethon import TelegramClient, events
             
             logger.info("🔄 Запуск мониторинга каналов...")
             
@@ -209,6 +207,9 @@ class ChannelMonitor:
             me = await self.telethon_client.get_me()
             logger.info(f"✅ Мониторинг запущен от имени: {me.first_name} (@{me.username})")
             
+            # Проверяем доступ к приватному каналу-посреднику
+            await self._check_private_channel_access()
+            
             self.is_running = True
             
             # Тестируем подключение к каналам
@@ -217,6 +218,44 @@ class ChannelMonitor:
         except Exception as e:
             logger.error(f"❌ Ошибка запуска мониторинга: {e}")
             raise
+
+    async def _check_private_channel_access(self):
+        """Проверка доступа к приватному каналу-посреднику"""
+        try:
+            if not self.intermediate_channel_id:
+                logger.error("❌ Не указан ID приватного канала-посредника в config/channel_config.json")
+                return False
+                
+            # Для приватных каналов используем только ID
+            entity = await self.telethon_client.get_entity(self.intermediate_channel_id)
+            channel_title = getattr(entity, 'title', 'Приватный канал')
+            self.intermediate_channel_title = channel_title
+            
+            # Проверяем права бота в канале
+            try:
+                participant = await self.telethon_client.get_permissions(
+                    entity, 
+                    await self.telethon_client.get_me()
+                )
+                if participant.post_messages:
+                    logger.info(f"✅ Доступ к приватному каналу подтвержден: {channel_title} (ID: {self.intermediate_channel_id})")
+                    return True
+                else:
+                    logger.error("❌ Бот не имеет прав на отправку сообщений в приватный канал")
+                    return False
+            except:
+                # Если не можем проверить права, но можем получить сущность - считаем что доступ есть
+                logger.info(f"✅ Доступ к приватному каналу подтвержден: {channel_title} (ID: {self.intermediate_channel_id})")
+                return True
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка доступа к приватному каналу: {e}")
+            logger.error("Убедитесь, что:")
+            logger.error("1. Приватный канал существует")
+            logger.error("2. Бот добавлен в канал как администратор")
+            logger.error("3. Указан правильный channel_id (отрицательное число)")
+            logger.error("4. Бот имеет права на отправку сообщений")
+            return False
 
     async def _test_channel_connection(self):
         """Тестирование подключения к каналам"""
@@ -227,7 +266,7 @@ class ChannelMonitor:
                 
             logger.info(f"🔍 Тестируем подключение к {len(self.monitored_channels)} каналам...")
             
-            for channel in list(self.monitored_channels)[:5]:  # Проверяем первые 5 каналов
+            for channel in list(self.monitored_channels)[:5]:
                 try:
                     entity = await self.telethon_client.get_entity(channel)
                     logger.info(f"✅ Канал доступен: {channel} -> {getattr(entity, 'title', 'Unknown')}")
@@ -244,15 +283,15 @@ class ChannelMonitor:
         self.is_running = False
         logger.info("⏹️ Мониторинг каналов остановлен")
         
-    async def add_user_channels(self, user_id, channels):
-        """Добавление каналов для мониторинга пользователя"""
+    async def add_channel_monitoring(self, chat_id, channels):
+        """Добавление каналов для мониторинга чата"""
         try:
             from telethon import events
             
             if not self.telethon_client or not self.telethon_client.is_connected():
                 await self.start()
             
-            logger.info(f"📡 Добавляем каналы для пользователя {user_id}: {channels}")
+            logger.info(f"📡 Добавляем каналы для чата {chat_id}: {channels}")
             
             # Добавляем каналы в общий список
             new_channels = []
@@ -267,18 +306,18 @@ class ChannelMonitor:
                 return
             
             # Удаляем старый обработчик если есть
-            if user_id in self.user_handlers:
-                self.telethon_client.remove_event_handler(self.user_handlers[user_id])
-                logger.info(f"   🔄 Обновляем обработчик для пользователя {user_id}")
+            if chat_id in self.channel_handlers:
+                self.telethon_client.remove_event_handler(self.channel_handlers[chat_id])
+                logger.info(f"   🔄 Обновляем обработчик для чата {chat_id}")
             
             # Создаем новый обработчик для ВСЕХ отслеживаемых каналов
             @self.telethon_client.on(events.NewMessage(chats=list(self.monitored_channels)))
             async def message_handler(event):
-                await self._process_new_post(user_id, event.message)
+                await self._process_new_post(chat_id, event.message)
             
-            self.user_handlers[user_id] = message_handler
+            self.channel_handlers[chat_id] = message_handler
             
-            logger.info(f"✅ Добавлены каналы для пользователя {user_id}: {len(new_channels)} новых каналов")
+            logger.info(f"✅ Добавлены каналы для чата {chat_id}: {len(new_channels)} новых каналов")
             logger.info(f"📊 Всего отслеживаемых каналов: {len(self.monitored_channels)}")
             
             # Тестируем подключение к новым каналам
@@ -290,58 +329,79 @@ class ChannelMonitor:
                     logger.error(f"❌ Ошибка подключения к каналу {channel}: {e}")
             
         except Exception as e:
-            logger.error(f"Ошибка добавления каналов для пользователя {user_id}: {e}")
+            logger.error(f"Ошибка добавления каналов для чата {chat_id}: {e}")
             
-    async def remove_user_channels(self, user_id, channels_to_remove):
-        """Удаление каналов из мониторинга пользователя"""
+    async def remove_channel_monitoring(self, chat_id, channels_to_remove):
+        """Удаление каналов из мониторинга чата"""
         try:
-            user_data_path = f"data/users/{user_id}/user_data.json"
-            if not os.path.exists(user_data_path):
+            chat_data_path = f"data/chats/{chat_id}/chat_data.json"
+            if not os.path.exists(chat_data_path):
                 return False
                 
-            user_data = await self._safe_json_load(user_data_path)
-            if user_data is None:
+            chat_data = await self._safe_json_load(chat_data_path)
+            if chat_data is None:
                 return False
                 
-            current_channels = user_data.get('channels', [])
+            current_channels = chat_data.get('channels', [])
             updated_channels = [ch for ch in current_channels if ch not in channels_to_remove]
             
             if len(updated_channels) == len(current_channels):
                 return False  # Ничего не изменилось
             
-            # Удаляем каналы из общего списка
+            # Удаляем каналы из общего списка если они больше никем не используются
             for channel in channels_to_remove:
+                if self._is_channel_used_by_others(chat_id, channel):
+                    continue
                 if channel in self.monitored_channels:
                     self.monitored_channels.remove(channel)
                     logger.info(f"   ➖ Удален канал: {channel}")
             
-            user_data['channels'] = updated_channels
-            user_data['updated_at'] = datetime.now().isoformat()
+            chat_data['channels'] = updated_channels
+            chat_data['updated_at'] = datetime.now().isoformat()
             
-            await self._safe_json_save(user_data_path, user_data)
+            await self._safe_json_save(chat_data_path, chat_data)
             
             # Перезагружаем обработчики с обновленным списком каналов
             if updated_channels:
-                await self.add_user_channels(user_id, updated_channels)
+                await self.add_channel_monitoring(chat_id, updated_channels)
             else:
                 # Если каналов не осталось, удаляем обработчик
-                if user_id in self.user_handlers:
-                    self.telethon_client.remove_event_handler(self.user_handlers[user_id])
-                    del self.user_handlers[user_id]
-                    logger.info(f"   🗑️ Удален обработчик для пользователя {user_id}")
+                if chat_id in self.channel_handlers:
+                    self.telethon_client.remove_event_handler(self.channel_handlers[chat_id])
+                    del self.channel_handlers[chat_id]
+                    logger.info(f"   🗑️ Удален обработчик для чата {chat_id}")
             
-            logger.info(f"✅ Удалены каналы для пользователя {user_id}: {len(channels_to_remove)} каналов")
+            logger.info(f"✅ Удалены каналы для чата {chat_id}: {len(channels_to_remove)} каналов")
             logger.info(f"📊 Всего отслеживаемых каналов: {len(self.monitored_channels)}")
             return True
             
         except Exception as e:
-            logger.error(f"Ошибка удаления каналов для пользователя {user_id}: {e}")
+            logger.error(f"Ошибка удаления каналов для чата {chat_id}: {e}")
+            return False
+
+    def _is_channel_used_by_others(self, current_chat_id, channel):
+        """Проверяет, используется ли канал другими чатами"""
+        try:
+            if not os.path.exists('data/chats'):
+                return False
+                
+            for chat_folder in os.listdir('data/chats'):
+                if chat_folder == str(current_chat_id):
+                    continue
+                    
+                chat_data_path = f"data/chats/{chat_folder}/chat_data.json"
+                chat_data = self._safe_json_load_sync(chat_data_path)
+                if chat_data and channel in chat_data.get('channels', []):
+                    return True
+            return False
+        except Exception as e:
+            logger.error(f"Error checking channel usage: {e}")
             return False
             
-    async def _process_new_post(self, user_id, message):
+    async def _process_new_post(self, chat_id, message):
         """Обработка нового поста"""
         try:
-            logger.info(f"🎯 ПОЛУЧЕНО СООБЩЕНИЕ ИЗ КАНАЛА")
+            logger.info(f"🎯 ПОЛУЧЕНО СООБЩЕНИЕ ИЗ КАНАЛА ДЛЯ ЧАТА {chat_id}")
             
             # Пропускаем сообщения без текста (только медиа)
             if not message.text and not message.message:
@@ -352,7 +412,7 @@ class ChannelMonitor:
             message_text = message.text or message.message or ""
             logger.info(f"   📝 Текст сообщения: {message_text[:100]}...")
             
-            if len(message_text.strip()) < 10:  # Минимальная длина для тестирования
+            if len(message_text.strip()) < 10:
                 logger.info(f"   📏 Слишком короткое сообщение ({len(message_text.strip())} chars) - пропускаем")
                 return
             
@@ -364,43 +424,44 @@ class ChannelMonitor:
             logger.info(f"   🆔 ID сообщения: {message.id}")
             logger.info(f"   📏 Длина текста: {len(message_text)} символов")
             
-            # Сохраняем всю информацию о сообщении для пересылки
+            # Создание отпечатка и оценка интересности
+            logger.info("   🧠 Анализируем сообщение нейросетью...")
+            fingerprint = self.neural_processor.create_fingerprint(message_text)
+            interest_score = self.neural_processor.calculate_interest_score(message_text)
+            
+            # Сохраняем метаданные для пересылки через приватный канал-посредник
             post_data = {
                 'id': message.id,
-                'text': message_text,
                 'channel': channel_username if channel_username else channel_title,
                 'channel_id': chat.id,
                 'message_id': message.id,
                 'timestamp': datetime.now().isoformat(),
                 'url': f"https://t.me/{channel_username}/{message.id}" if channel_username else f"https://t.me/c/{str(chat.id).replace('-100', '')}/{message.id}",
                 'has_media': bool(message.media),
-                'is_forward': bool(message.forward)
+                'is_forward': bool(message.forward),
+                'chat_id': chat_id,
+                'fingerprint': fingerprint,
+                'interest_score': interest_score,
+                'original_message_id': message.id,
+                'original_channel_id': chat.id,
+                'message_object': None  # Не сохраняем объект сообщения для безопасности
             }
-            
-            logger.info("   🧠 Анализируем сообщение нейросетью...")
-            
-            # Создание отпечатка и оценка интересности
-            fingerprint = self.neural_processor.create_fingerprint(post_data['text'])
-            interest_score = self.neural_processor.calculate_interest_score(post_data['text'])
-            
-            post_data['fingerprint'] = fingerprint
-            post_data['interest_score'] = interest_score
             
             logger.info(f"   🔑 Отпечаток: {fingerprint[:16]}...")
             logger.info(f"   ⭐ Оценка интересности: {interest_score:.2f}/1.0")
             
-            await self._add_to_user_queue(user_id, post_data)
+            await self._add_to_chat_queue(chat_id, post_data)
             
         except Exception as e:
-            logger.error(f"❌ Ошибка обработки поста для пользователя {user_id}: {e}")
+            logger.error(f"❌ Ошибка обработки поста для чата {chat_id}: {e}")
             
-    async def _add_to_user_queue(self, user_id, post_data):
-        """Добавление поста в очередь пользователя"""
+    async def _add_to_chat_queue(self, chat_id, post_data):
+        """Добавление поста в очередь чата"""
         try:
-            logger.info(f"   📥 Добавляем пост в очередь пользователя {user_id}...")
+            logger.info(f"   📥 Добавляем пост в очередь чата {chat_id}...")
             
-            queue_path = f"data/users/{user_id}/queue.json"
-            archive_path = f"data/users/{user_id}/archive.json"
+            queue_path = f"data/chats/{chat_id}/queue.json"
+            archive_path = f"data/chats/{chat_id}/archive.json"
             
             os.makedirs(os.path.dirname(queue_path), exist_ok=True)
             
@@ -417,13 +478,7 @@ class ChannelMonitor:
             
             duplicate_index = None
             for i, queued_post in enumerate(queue):
-                if (queued_post.get('fingerprint') == post_data['fingerprint'] or 
-                    self.neural_processor.are_posts_similar(
-                        queued_post.get('fingerprint'), 
-                        post_data['fingerprint'],
-                        queued_post.get('text', ''),
-                        post_data['text']
-                    )):
+                if self.neural_processor.are_posts_similar(queued_post.get('fingerprint'), post_data['fingerprint']):
                     duplicate_index = i
                     logger.info(f"   🔄 Найден дубликат поста в позиции {i}")
                     break
@@ -431,34 +486,53 @@ class ChannelMonitor:
             if duplicate_index is not None:
                 if post_data['interest_score'] > queue[duplicate_index]['interest_score']:
                     queue[duplicate_index] = post_data
-                    logger.info(f"   ✅ Заменен дубликат поста для пользователя {user_id}")
+                    logger.info(f"   ✅ Заменен дубликат поста для чата {chat_id}")
                 else:
                     logger.info(f"   📭 Дубликат имеет лучшую оценку, пропускаем")
             else:
                 queue.append(post_data)
-                logger.info(f"   ✅ Добавлен новый пост в очередь для пользователя {user_id}")
+                logger.info(f"   ✅ Добавлен новый пост в очередь для чата {chat_id}")
             
             # Безопасное сохранение JSON
             await self._safe_json_save(queue_path, queue)
             logger.info(f"   💾 Очередь сохранена, новый размер: {len(queue)} постов")
                 
-            await self._update_user_stats(user_id, 'processed')
+            await self._update_chat_stats(chat_id, 'processed')
             
         except Exception as e:
-            logger.error(f"❌ Ошибка добавления в очередь для пользователя {user_id}: {e}")
+            logger.error(f"❌ Ошибка добавления в очередь для чата {chat_id}: {e}")
     
     async def _safe_json_load(self, filepath):
-        """Безопасная загрузка JSON файла"""
+        """Безопасная загрузка JSON файла (асинхронная версия)"""
         try:
             if os.path.exists(filepath):
                 async with aiofiles.open(filepath, 'r', encoding='utf-8') as f:
                     content = await f.read()
-                    if content.strip():  # Проверяем что файл не пустой
+                    if content.strip():
                         return json.loads(content)
             return None
         except json.JSONDecodeError as e:
             logger.error(f"❌ Ошибка чтения JSON файла {filepath}: {e}")
-            # Создаем резервную копию поврежденного файла
+            backup_path = f"{filepath}.backup.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            if os.path.exists(filepath):
+                os.rename(filepath, backup_path)
+                logger.info(f"📦 Создана резервная копия поврежденного файла: {backup_path}")
+            return None
+        except Exception as e:
+            logger.error(f"❌ Ошибка загрузки файла {filepath}: {e}")
+            return None
+
+    def _safe_json_load_sync(self, filepath):
+        """Безопасная загрузка JSON файла (синхронная версия)"""
+        try:
+            if os.path.exists(filepath):
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    if content.strip():
+                        return json.loads(content)
+            return None
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ Ошибка чтения JSON файла {filepath}: {e}")
             backup_path = f"{filepath}.backup.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             if os.path.exists(filepath):
                 os.rename(filepath, backup_path)
@@ -476,29 +550,30 @@ class ChannelMonitor:
         except Exception as e:
             logger.error(f"❌ Ошибка сохранения файла {filepath}: {e}")
             
-    async def _update_user_stats(self, user_id, stat_type):
-        """Обновление статистики пользователя"""
+    async def _update_chat_stats(self, chat_id, stat_type):
+        """Обновление статистики чата"""
         try:
-            user_data_path = f"data/users/{user_id}/user_data.json"
+            chat_data_path = f"data/chats/{chat_id}/chat_data.json"
             
-            user_data = await self._safe_json_load(user_data_path)
-            if user_data is None:
-                user_data = {
+            chat_data = await self._safe_json_load(chat_data_path)
+            if chat_data is None:
+                chat_data = {
                     'channels': [],
                     'created_at': datetime.now().isoformat(),
                     'updated_at': datetime.now().isoformat(),
                     'total_processed': 0,
-                    'total_sent': 0
+                    'total_sent': 0,
+                    'chat_type': 'unknown'
                 }
             
             if stat_type == 'processed':
-                user_data['total_processed'] = user_data.get('total_processed', 0) + 1
+                chat_data['total_processed'] = chat_data.get('total_processed', 0) + 1
             
-            user_data['updated_at'] = datetime.now().isoformat()
+            chat_data['updated_at'] = datetime.now().isoformat()
             
-            await self._safe_json_save(user_data_path, user_data)
+            await self._safe_json_save(chat_data_path, chat_data)
         except Exception as e:
-            logger.error(f"❌ Ошибка обновления статистики для пользователя {user_id}: {e}")
+            logger.error(f"❌ Ошибка обновления статистики для чата {chat_id}: {e}")
 
 class NewsBot:
     def __init__(self):
@@ -510,7 +585,17 @@ class NewsBot:
             logger.error("❌ Не заполнены конфигурационные данные в config/tg_config.json")
             sys.exit(1)
             
-        self.application = Application.builder().token(self.bot_token).build()
+        # Создаем Application с настройками для обработки сетевых ошибок
+        self.application = (
+            Application.builder()
+            .token(self.bot_token)
+            .pool_timeout(30)
+            .connect_timeout(30)
+            .read_timeout(30)
+            .write_timeout(30)
+            .build()
+        )
+        
         self.neural_processor = NeuralNewsProcessor()
         self.channel_monitor = ChannelMonitor(self.api_id, self.api_hash, self.neural_processor, self.application)
         
@@ -539,6 +624,9 @@ class NewsBot:
         self.application.add_handler(CommandHandler("help", self.help_handler))
         self.application.add_handler(CommandHandler("debug", self.debug_handler))
         
+        # Обработчик callback query для удаления каналов
+        self.application.add_handler(CallbackQueryHandler(self.callback_handler, pattern="^remove_"))
+        
         # Обработчик текстовых сообщений
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.message_handler))
         
@@ -546,21 +634,59 @@ class NewsBot:
         self.application.add_error_handler(self.error_handler)
     
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик ошибок"""
+        """Обработчик ошибок с фильтрацией сообщений от бота"""
         try:
+            # Пропускаем ошибки от пересланных сообщений
+            if update and update.effective_message:
+                # Если сообщение переслано из нашего приватного канала - игнорируем ошибку
+                if (update.effective_message.forward_from_chat and 
+                    update.effective_message.forward_from_chat.id == self.channel_monitor.intermediate_channel_id):
+                    logger.debug("🔇 Игнорируем ошибку от пересланного сообщения")
+                    return
+                    
+                # Если сообщение от самого бота - игнорируем
+                if (update.effective_message.from_user and 
+                    update.effective_message.from_user.id == self.application.bot.id):
+                    logger.debug("🔇 Игнорируем ошибку от сообщения бота")
+                    return
+
             logger.error(f"Exception while handling an update: {context.error}")
             
-            # Логируем полную трассировку
+            if isinstance(context.error, NetworkError):
+                logger.warning(f"Network error occurred: {context.error}")
+                return
+            
             logger.error(f"Traceback: {context.error.__traceback__}")
             
-            # Отправляем сообщение пользователю
-            if update and update.effective_user:
-                await context.bot.send_message(
-                    chat_id=update.effective_user.id,
-                    text="❌ Произошла ошибка при обработке запроса. Попробуйте еще раз."
-                )
+            # Отправляем сообщение об ошибке только если это не пересланное сообщение
+            if update and update.effective_chat:
+                try:
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text="❌ Произошла ошибка при обработке запроса. Попробуйте еще раз."
+                    )
+                except Exception as e:
+                    logger.error(f"Error sending error message: {e}")
+                    
         except Exception as e:
             logger.error(f"Error in error handler: {e}")
+    
+    async def callback_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик callback query"""
+        query = update.callback_query
+        await query.answer()
+        
+        chat_id = update.effective_chat.id
+        data = query.data
+        
+        if data.startswith("remove_"):
+            channel_to_remove = data.replace("remove_", "")
+            success = await self.channel_monitor.remove_channel_monitoring(chat_id, [channel_to_remove])
+            
+            if success:
+                await query.edit_message_text(f"✅ Канал {channel_to_remove} удален из отслеживания")
+            else:
+                await query.edit_message_text(f"❌ Не удалось удалить канал {channel_to_remove}")
     
     def get_main_keyboard(self):
         """Клавиатура с основными командами"""
@@ -573,20 +699,28 @@ class NewsBot:
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, input_field_placeholder="Выберите команду...")
     
     async def start_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        user_folder = f"data/users/{user_id}"
-        os.makedirs(user_folder, exist_ok=True)
+        chat_id = update.effective_chat.id
+        chat_type = update.effective_chat.type
         
-        await self.create_user_files(user_id)
+        chat_type_str = "личные сообщения" if chat_type == "private" else f"группа '{update.effective_chat.title}'"
         
-        welcome_text = """
+        chat_folder = f"data/chats/{chat_id}"
+        os.makedirs(chat_folder, exist_ok=True)
+        
+        await self.create_chat_files(chat_id, chat_type)
+        
+        welcome_text = f"""
 🤖 Добро пожаловать в All News Bot!
 
-🎯 **Включено детальное логирование:**
-• 📨 Логирование всех постов из каналов
-• 🔍 Подробная информация о каждом сообщении
-• 🧠 Логи анализа нейросетями
-• 📊 Статус добавления в очередь
+💬 **Режим работы:** {chat_type_str}
+
+🎯 **Новые возможности:**
+• 📨 Пересылка оригинальных сообщений через ПРИВАТНЫЙ канал-посредник
+• 👥 Работа в группах и личных сообщениях
+• 🔗 Сохранение форматирования и медиа
+• 🧠 Умная фильтрация дубликатов
+• 📢 Сообщения пересылаются от имени приватного канала
+• 🔒 Максимальная конфиденциальность
 
 📋 **Основные команды:**
 • /add_channels - добавить каналы
@@ -598,7 +732,7 @@ class NewsBot:
 • /help - помощь
 • /debug - отладочная информация
 
-💡 **Теперь вы увидите в логах все посты из каналов!**
+💡 **Бот теперь пересылает оригинальные сообщения через ПРИВАТНЫЙ канал-посредник!**
         """
         
         await update.message.reply_text(
@@ -608,7 +742,7 @@ class NewsBot:
     
     async def debug_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Отладочная информация"""
-        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
         
         debug_info = f"""
 🔧 **Отладочная информация**
@@ -616,14 +750,16 @@ class NewsBot:
 📊 Мониторинг:
 • Статус: {'🟢 Активен' if self.channel_monitor.is_running else '🔴 Неактивен'}
 • Отслеживаемых каналов: {len(self.channel_monitor.monitored_channels)}
-• Обработчиков пользователей: {len(self.channel_monitor.user_handlers)}
+• Обработчиков чатов: {len(self.channel_monitor.channel_handlers)}
+• Приватный канал: {self.channel_monitor.intermediate_channel_title}
+• ID канала: {self.channel_monitor.intermediate_channel_id}
 
 📋 Ваши каналы:
 """
         
-        user_data = await self.channel_monitor._safe_json_load(f"data/users/{user_id}/user_data.json")
-        if user_data and user_data.get('channels'):
-            for channel in user_data['channels']:
+        chat_data = await self.channel_monitor._safe_json_load(f"data/chats/{chat_id}/chat_data.json")
+        if chat_data and chat_data.get('channels'):
+            for channel in chat_data['channels']:
                 debug_info += f"• {channel}\n"
         else:
             debug_info += "• Нет каналов\n"
@@ -633,7 +769,7 @@ class NewsBot:
 • Устройство: {'🎮 GPU' if str(DEVICE) == 'cuda' else '💻 CPU'}
 • Модели загружены: ✅
 
-💡 Проверьте логи в терминале для отслеживания постов!
+💬 Режим: {'👤 Личные сообщения' if update.effective_chat.type == 'private' else '👥 Группа'}
         """
         
         await update.message.reply_text(
@@ -661,11 +797,13 @@ class NewsBot:
 `/help` - показать это сообщение
 `/start` - перезапустить бота
 
-🎯 **Логирование:**
-• 📨 Все посты из каналов логируются
-• 🔍 Подробная информация о каждом сообщении
-• 🧠 Результаты анализа нейросетями
-• 📊 Статус добавления в очередь
+🔄 **Новый функционал:**
+• 📨 Пересылка оригинальных сообщений через ПРИВАТНЫЙ канал
+• 👥 Работа в группах
+• 🔗 Сохранение медиа и форматирования
+• 🧠 Умная фильтрация дубликатов
+• 📢 Сообщения от имени приватного канала-посредника
+• 🔒 Максимальная конфиденциальность
 
 💡 **Формат каналов:**
 t.me/*channel_name*
@@ -679,24 +817,34 @@ https://t.me/*channel*
         )
     
     async def add_channels_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды добавления каналов"""
+        chat_id = update.effective_chat.id
+        
+        if 'chat_data' not in context.chat_data:
+            context.chat_data['chat_data'] = {}
+        context.chat_data['chat_data']['awaiting_channels'] = True
+        
+        logger.info(f"🟢 Установлен флаг awaiting_channels для чата {chat_id}")
+        
         await update.message.reply_text(
-            "Присылайте ссылки на Telegram каналы (каждую с новой строки):\n\n"
-            "Пример:\n"
+            "📥 **Добавление каналов**\n\n"
+            "Пришлите ссылки на Telegram каналы (каждую с новой строки):\n\n"
+            "**Примеры:**\n"
             "t.me/rbc_news\n"
             "@meduzaproject\n"
             "https://t.me/rian_ru\n\n"
-            "🎯 Теперь включено детальное логирование всех постов!",
+            "🎯 Бот будет пересылать оригинальные сообщения из этих каналов через ПРИВАТНЫЙ канал-посредник!",
             reply_markup=self.get_main_keyboard()
         )
 
     async def my_channels_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показать отслеживаемые каналы"""
-        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
         
-        user_data = await self.channel_monitor._safe_json_load(f"data/users/{user_id}/user_data.json")
+        chat_data = await self.channel_monitor._safe_json_load(f"data/chats/{chat_id}/chat_data.json")
         
-        if user_data and user_data.get('channels'):
-            channels = user_data.get('channels', [])
+        if chat_data and chat_data.get('channels'):
+            channels = chat_data.get('channels', [])
             channels_text = "\n".join([f"• {channel}" for channel in channels])
             message = f"📋 **Ваши отслеживаемые каналы** ({len(channels)}):\n\n{channels_text}\n\n💡 Используйте /remove_channels чтобы удалить каналы"
         else:
@@ -709,518 +857,678 @@ https://t.me/*channel*
 
     async def remove_channels_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Удаление каналов из отслеживания"""
-        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
         
-        user_data = await self.channel_monitor._safe_json_load(f"data/users/{user_id}/user_data.json")
-        if not user_data:
+        chat_data = await self.channel_monitor._safe_json_load(f"data/chats/{chat_id}/chat_data.json")
+        if not chat_data:
             await update.message.reply_text(
                 "❌ У вас нет отслеживаемых каналов.",
                 reply_markup=self.get_main_keyboard()
             )
             return
         
-        channels = user_data.get('channels', [])
-        
+        channels = chat_data.get('channels', [])
         if not channels:
             await update.message.reply_text(
-                "❌ У вас нет отслеживаемых каналов.",
+                "❌ У вас нет отслеживаемых каналы.",
                 reply_markup=self.get_main_keyboard()
             )
             return
         
-        channels_text = "\n".join([f"• {channel}" for channel in channels])
+        # Создаем клавиатуру с каналами для удаления
+        keyboard = []
+        for channel in channels:
+            keyboard.append([InlineKeyboardButton(f"❌ {channel}", callback_data=f"remove_{channel}")])
+        
+        keyboard.append([InlineKeyboardButton("✅ Завершить удаление", callback_data="remove_done")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(
-            f"🗑️ **Удаление каналов**\n\n"
-            f"Ваши каналы:\n{channels_text}\n\n"
-            f"Пришлите каналы для удаления (каждый с новой строки):\n\n"
-            f"Пример:\n@channel1\n@channel2",
-            reply_markup=self.get_main_keyboard()
-        )
-        
-        # Сохраняем состояние для следующего сообщения
-        context.user_data['awaiting_channels_removal'] = True
-
-    async def test_post_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Тест обработки поста"""
-        test_text = """
-        Тестовый пост: В Москве прошло важное совещание по развитию технологий. 
-        Эксперты обсудили перспективы искусственного интеллекта и машинного обучения. 
-        Были представлены новые исследования в области нейросетей.
-        """
-        
-        fingerprint = self.neural_processor.create_fingerprint(test_text)
-        interest_score = self.neural_processor.calculate_interest_score(test_text)
-        
-        gpu_status = "🎮 (на GPU)" if str(DEVICE) == "cuda" else "💻 (на CPU)"
-        
-        await update.message.reply_text(
-            f"🧪 **Тест обработки поста** {gpu_status}:\n\n"
-            f"Текст: {test_text[:100]}...\n"
-            f"Отпечаток: {fingerprint[:16]}...\n"
-            f"Оценка интересности: {interest_score:.2f}/1.0\n"
-            f"⭐ Рейтинг: {'⭐' * int(interest_score * 5)}",
-            reply_markup=self.get_main_keyboard()
-        )
-
-    async def monitor_status_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Статус мониторинга"""
-        status = "🟢 Активен" if self.channel_monitor.is_running else "🔴 Неактивен"
-        gpu_status = "🎮 GPU" if str(DEVICE) == "cuda" else "💻 CPU"
-        
-        await update.message.reply_text(
-            f"📊 **Статус системы**:\n\n"
-            f"Мониторинг: {status}\n"
-            f"Пользователей: {len(self.channel_monitor.user_handlers)}\n"
-            f"Отслеживаемых каналов: {len(self.channel_monitor.monitored_channels)}\n"
-            f"Нейросети: 🟢 Активны ({gpu_status})\n"
-            f"Логирование: 📨 Детальное\n"
-            f"Пересылка сообщений: 🟢 Включена\n"
-            f"Очередь обработки: 🟢 Работает",
-            reply_markup=self.get_main_keyboard()
+            "🗑️ **Удаление каналов**\n\n"
+            "Выберите каналы для удаления:",
+            reply_markup=reply_markup
         )
 
     async def stats_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Статистика пользователя"""
+        """Статистика и метрики"""
+        chat_id = update.effective_chat.id
+        
+        chat_data = await self.channel_monitor._safe_json_load(f"data/chats/{chat_id}/chat_data.json")
+        
+        if chat_data:
+            channels_count = len(chat_data.get('channels', []))
+            total_processed = chat_data.get('total_processed', 0)
+            total_sent = chat_data.get('total_sent', 0)
+            created_at = chat_data.get('created_at', 'неизвестно')
+            updated_at = chat_data.get('updated_at', 'неизвестно')
+            
+            stats_text = f"""
+📊 **Статистика для этого чата**
+
+📋 **Каналы:**
+• Отслеживаемых каналов: {channels_count}
+• Обработано сообщений: {total_processed}
+• Отправлено в чат: {total_sent}
+
+📅 **Время:**
+• Создан: {created_at[:16]}
+• Обновлен: {updated_at[:16]}
+
+🎯 **Мониторинг:**
+• Статус: {'🟢 Активен' if self.channel_monitor.is_running else '🔴 Неактивен'}
+• Отслеживаемых каналов (всего): {len(self.channel_monitor.monitored_channels)}
+• Приватный канал: {self.channel_monitor.intermediate_channel_title}
+
+💡 **Режим пересылки:** 📨 Через приватный канал
+            """
+        else:
+            stats_text = "❌ Статистика недоступна. Используйте /start для инициализации."
+        
+        await update.message.reply_text(
+            stats_text,
+            reply_markup=self.get_main_keyboard()
+        )
+
+    async def test_post_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Тестирование работы нейросетей"""
+        chat_id = update.effective_chat.id
+        
+        test_text = """
+        Важная новость: Центробанк принял решение о ключевой ставке. 
+        Эксперты ожидают изменений в финансовой политике на фоне текущей экономической ситуации.
+        """
+        
+        await update.message.reply_text("🧠 **Тестирование нейросетей...**")
+        
         try:
-            user_id = update.effective_user.id
+            fingerprint = self.neural_processor.create_fingerprint(test_text)
+            interest_score = self.neural_processor.calculate_interest_score(test_text)
             
-            # Безопасная загрузка данных
-            user_data = await self.channel_monitor._safe_json_load(f"data/users/{user_id}/user_data.json")
-            queue = await self.channel_monitor._safe_json_load(f"data/users/{user_id}/queue.json") or []
-            
-            gpu_status = "🎮 (GPU)" if str(DEVICE) == "cuda" else "💻 (CPU)"
-            
-            if user_data:
-                stats_text = f"""
-📊 **Ваша статистика** {gpu_status}:
+            test_results = f"""
+✅ **Тест нейросетей завершен**
 
-• Отслеживаемых каналов: {len(user_data.get('channels', []))}
-• Новостей в очереди: {len(queue)}
-• Обработано новостей: {user_data.get('total_processed', 0)}
-• Отправлено подборок: {user_data.get('total_sent', 0)}
-• Логирование: 📨 Детальное
+📝 **Тестовый текст:**
+"{test_text[:100]}..."
 
-💡 Используйте /my_channels чтобы посмотреть каналы
-                """
-            else:
-                stats_text = "❌ Данные не найдены. Используйте /start для инициализации."
+🔑 **Цифровой отпечаток:**
+{fingerprint[:32]}...
+
+⭐ **Оценка интересности:**
+{interest_score:.2f}/1.0
+
+🎯 **Интерпретация:**
+• Отпечаток: уникальный идентификатор текста
+• Оценка: вероятность того, что текст является новостью
+            """
             
             await update.message.reply_text(
-                stats_text,
+                test_results,
                 reply_markup=self.get_main_keyboard()
             )
-                
+            
         except Exception as e:
-            logger.error(f"Error in stats handler: {e}")
+            logger.error(f"Ошибка тестирования нейросетей: {e}")
             await update.message.reply_text(
-                "❌ Ошибка при получении статистики.",
+                f"❌ Ошибка тестирования: {e}",
                 reply_markup=self.get_main_keyboard()
             )
 
-    async def create_user_files(self, user_id):
-        """Создание файлов пользователя"""
-        user_folder = f"data/users/{user_id}"
-        base_files = {
-            'queue.json': [],
-            'archive.json': [],
-            'user_data.json': {
-                'channels': [],
-                'created_at': datetime.now().isoformat(),
-                'updated_at': datetime.now().isoformat(),
-                'total_processed': 0,
-                'total_sent': 0
-            }
-        }
+    async def monitor_status_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Статус мониторинга каналов"""
+        chat_id = update.effective_chat.id
         
-        for filename, content in base_files.items():
-            filepath = f"{user_folder}/{filename}"
-            if not os.path.exists(filepath):
-                await self.channel_monitor._safe_json_save(filepath, content)
-    
+        status_text = f"""
+📡 **Статус мониторинга каналов**
+
+🔄 **Общий статус:**
+• Мониторинг: {'🟢 АКТИВЕН' if self.channel_monitor.is_running else '🔴 НЕАКТИВЕН'}
+• Всего отслеживаемых каналов: {len(self.channel_monitor.monitored_channels)}
+• Активных обработчиков: {len(self.channel_monitor.channel_handlers)}
+
+📊 **Ваши данные:**
+• Ваш chat_id: {chat_id}
+• Ваши каналы: {len(self.channel_monitor._safe_json_load_sync(f'data/chats/{chat_id}/chat_data.json').get('channels', [])) if os.path.exists(f'data/chats/{chat_id}/chat_data.json') else 0}
+
+🎮 **Техническая информация:**
+• Устройство нейросетей: {'🎮 GPU' if str(DEVICE) == 'cuda' else '💻 CPU'}
+• Приватный канал: {self.channel_monitor.intermediate_channel_title}
+• ID канала: {self.channel_monitor.intermediate_channel_id}
+• Режим пересылки: 📨 Через приватный канал
+            """
+        
+        await update.message.reply_text(
+            status_text,
+            reply_markup=self.get_main_keyboard()
+        )
+
     async def message_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        text = update.message.text
+        """Обработчик текстовых сообщений"""
+        chat_id = update.effective_chat.id
+        message_text = update.message.text
         
-        # Проверяем, ожидаем ли мы удаление каналов
-        if context.user_data.get('awaiting_channels_removal'):
-            context.user_data['awaiting_channels_removal'] = False
-            channels_to_remove = self.parse_channels(text)
+        logger.info(f"📨 Получено сообщение в чате {chat_id}: {message_text[:100]}...")
+        
+        chat_data = context.chat_data.get('chat_data', {})
+        if chat_data.get('awaiting_channels'):
+            logger.info(f"🟢 Обрабатываем ввод каналов для чата {chat_id}")
             
-            if channels_to_remove:
-                success = await self.channel_monitor.remove_user_channels(user_id, channels_to_remove)
-                if success:
-                    await update.message.reply_text(
-                        f"✅ Удалено {len(channels_to_remove)} каналов:\n" +
-                        "\n".join(f"• {ch}" for ch in channels_to_remove),
-                        reply_markup=self.get_main_keyboard()
-                    )
-                else:
-                    await update.message.reply_text(
-                        "❌ Не удалось удалить каналы. Проверьте правильность ввода.",
-                        reply_markup=self.get_main_keyboard()
-                    )
-            else:
+            context.chat_data['chat_data']['awaiting_channels'] = False
+            
+            await self.process_channels_input(update, message_text)
+            return
+        
+        await update.message.reply_text(
+            "🤖 Используйте команды из меню или /help для справки.",
+            reply_markup=self.get_main_keyboard()
+        )
+
+    async def process_channels_input(self, update: Update, message_text: str):
+        """Обработка введенных каналов"""
+        chat_id = update.effective_chat.id
+        
+        try:
+            raw_channels = [line.strip() for line in message_text.split('\n') if line.strip()]
+            
+            if not raw_channels:
                 await update.message.reply_text(
-                    "❌ Не удалось распознать каналы для удаления.",
+                    "❌ Не найдено валидных каналов. Попробуйте еще раз.",
                     reply_markup=self.get_main_keyboard()
                 )
-            return
-        
-        # Обычная обработка добавления каналов
-        if text.startswith('/'):
-            return
-            
-        channels = self.parse_channels(text)
-        
-        if channels:
-            await self.save_user_channels(user_id, channels)
-            await update.message.reply_text(
-                f"✅ Добавлено {len(channels)} каналов:\n" +
-                "\n".join(f"• {ch}" for ch in channels) +
-                f"\n\n🚀 Начинаю мониторинг в реальном времени!\n"
-                f"📨 Сообщения будут пересылаться из оригинальных каналов!\n"
-                f"📝 Включено детальное логирование всех постов!",
-                reply_markup=self.get_main_keyboard()
-            )
-            
-            await self.channel_monitor.add_user_channels(user_id, channels)
-            
-        else:
-            await update.message.reply_text(
-                "❌ Не удалось распознать каналы. Используйте форматы:\n"
-                "t.me/channel_name\n@channel_name\nhttps://t.me/channel\n\n"
-                "Или используйте команду /add_channels",
-                reply_markup=self.get_main_keyboard()
-            )
-    
-    def parse_channels(self, text):
-        channels = []
-        lines = text.strip().split('\n')
-        
-        for line in lines:
-            line = line.strip()
-            if 't.me/' in line:
-                match = re.search(r't\.me/([a-zA-Z0-9_]+)', line)
-                if match:
-                    channels.append(f"@{match.group(1)}")
-            elif line.startswith('@'):
-                channels.append(line)
-            elif line.startswith('https://t.me/'):
-                match = re.search(r'https://t\.me/([a-zA-Z0-9_]+)', line)
-                if match:
-                    channels.append(f"@{match.group(1)}")
-        
-        return list(set(channels))
-    
-    async def save_user_channels(self, user_id, channels):
-        user_data_path = f"data/users/{user_id}/user_data.json"
-        
-        user_data = await self.channel_monitor._safe_json_load(user_data_path)
-        if user_data is None:
-            user_data = {
-                'channels': [],
-                'created_at': datetime.now().isoformat(),
-                'updated_at': datetime.now().isoformat(),
-                'total_processed': 0,
-                'total_sent': 0
-            }
-        
-        existing_channels = set(user_data.get('channels', []))
-        new_channels = set(channels)
-        all_channels = list(existing_channels.union(new_channels))
-        
-        user_data['channels'] = all_channels
-        user_data['updated_at'] = datetime.now().isoformat()
-        
-        await self.channel_monitor._safe_json_save(user_data_path, user_data)
-        
-        logger.info(f"User {user_id} channels updated: {len(all_channels)} channels")
-    
-    async def process_queue(self):
-        """Обработка очереди"""
-        while True:
-            try:
-                if not os.path.exists('data/users'):
-                    await asyncio.sleep(CONSTANTS['queue_processing_interval'])
-                    continue
-                    
-                users_folders = os.listdir('data/users')
-                for user_folder in users_folders:
-                    user_id = user_folder
-                    await self.process_user_queue(user_id)
-                
-                await asyncio.sleep(CONSTANTS['queue_processing_interval'])
-            except Exception as e:
-                logger.error(f"Error processing queue: {e}")
-                await asyncio.sleep(60)
-    
-    async def process_user_queue(self, user_id):
-        """Обработка очереди пользователя"""
-        try:
-            queue_path = f"data/users/{user_id}/queue.json"
-            queue = await self.channel_monitor._safe_json_load(queue_path) or []
-            
-            if queue:
-                logger.info(f"📊 Обработка очереди пользователя {user_id}: {len(queue)} постов")
-            
-            archive_path = f"data/users/{user_id}/archive.json"
-            archive = await self.channel_monitor._safe_json_load(archive_path) or []
-            
-            now = datetime.now()
-            posts_to_send = []
-            updated_queue = []
-            
-            for post in queue:
-                try:
-                    post_time = datetime.fromisoformat(post['timestamp'])
-                    time_in_queue = now - post_time
-                    
-                    if time_in_queue.total_seconds() >= CONSTANTS['queue_ttl_seconds']:
-                        posts_to_send.append(post)
-                        archive.append({
-                            'fingerprint': post['fingerprint'],
-                            'archived_at': now.isoformat(),
-                            'original_channel': post.get('channel'),
-                            'interest_score': post.get('interest_score', 0)
-                        })
-                        logger.info(f"   📤 Готов к отправке: {post.get('channel')} - {post['text'][:50]}...")
-                    else:
-                        updated_queue.append(post)
-                except Exception as e:
-                    logger.error(f"Error processing post in queue: {e}")
-                    continue
-            
-            if posts_to_send:
-                logger.info(f"   🚀 Отправляем {len(posts_to_send)} постов пользователю {user_id}")
-                await self.send_posts_to_user(user_id, posts_to_send)
-                await self.update_user_stats(user_id, 'sent')
-            
-            await self.channel_monitor._safe_json_save(queue_path, updated_queue)
-            await self.channel_monitor._safe_json_save(archive_path, archive)
-                
-            if posts_to_send:
-                logger.info(f"✅ Отправлено {len(posts_to_send)} постов пользователю {user_id}")
-                
-        except Exception as e:
-            logger.error(f"Error processing user queue {user_id}: {e}")
-    
-    async def send_posts_to_user(self, user_id, posts):
-        """Отправка постов пользователю с пересылкой оригинальных сообщений"""
-        try:
-            posts.sort(key=lambda x: x.get('interest_score', 0), reverse=True)
-            top_posts = posts[:CONSTANTS['max_posts_per_batch']]
-            
-            if not top_posts:
                 return
             
-            logger.info(f"📨 Отправка подборки пользователю {user_id}: {len(top_posts)} постов")
+            processed_channels = []
+            invalid_channels = []
             
-            for i, post in enumerate(top_posts, 1):
-                try:
-                    logger.info(f"   📤 Отправка поста {i}/{len(top_posts)}: {post.get('channel')}")
-                    
-                    await self.send_text_message(user_id, post, i)
-                        
-                except Exception as e:
-                    logger.error(f"Error sending message to user {user_id}: {e}")
-                    # Fallback на текстовое сообщение при ошибке
-                    await self.send_text_message(user_id, post, i)
+            for channel in raw_channels:
+                processed_channel = self.process_channel_input(channel)
+                if processed_channel:
+                    processed_channels.append(processed_channel)
+                else:
+                    invalid_channels.append(channel)
             
-            logger.info(f"✅ Подборка отправлена пользователю {user_id}")
-            
-        except Exception as e:
-            logger.error(f"Error in send_posts_to_user for {user_id}: {e}")
-    
-    async def send_text_message(self, user_id, post, index):
-        """Отправка текстового сообщения с правильным форматированием ссылки"""
-        try:
-            # Форматируем сообщение: ссылка на канал и пост сверху, затем текст
-            channel_name = post.get('channel', 'Unknown').lstrip('@')
-            post_url = post.get('url', '')
-            
-            # Создаем сообщение с ссылкой в формате [Channel Name](url)
-            message = f"**[{channel_name}]({post_url})**\n\n{post['text']}"
-            
-            await self.application.bot.send_message(
-                chat_id=user_id,
-                text=message,
-                parse_mode='Markdown',
-                disable_web_page_preview=False
-            )
-            await asyncio.sleep(1)
-            
-        except Exception as e:
-            logger.error(f"❌ Ошибка отправки сообщения пользователю {user_id}: {e}")
-            # Fallback: отправка без Markdown форматирования
-            try:
-                fallback_message = f"{post.get('channel', 'Channel')} - {post.get('url', '')}\n\n{post['text']}"
-                await self.application.bot.send_message(
-                    chat_id=user_id,
-                    text=fallback_message,
-                    disable_web_page_preview=False
+            if not processed_channels:
+                await update.message.reply_text(
+                    "❌ Не найдено валидных каналов. Проверьте формат ввода.",
+                    reply_markup=self.get_main_keyboard()
                 )
-            except Exception as fallback_error:
-                logger.error(f"❌ Fallback отправка также не удалась: {fallback_error}")
-    
-    async def update_user_stats(self, user_id, stat_type):
-        """Обновление статистики"""
-        try:
-            user_data_path = f"data/users/{user_id}/user_data.json"
+                return
             
-            user_data = await self.channel_monitor._safe_json_load(user_data_path)
-            if user_data is None:
-                user_data = {
+            await self.save_channels_for_chat(chat_id, processed_channels)
+            await self.channel_monitor.add_channel_monitoring(chat_id, processed_channels)
+            
+            success_text = f"✅ **Добавлено каналов:** {len(processed_channels)}\n\n"
+            success_text += "\n".join([f"• {channel}" for channel in processed_channels])
+            
+            if invalid_channels:
+                success_text += f"\n\n❌ **Невалидные каналы:** {len(invalid_channels)}\n"
+                success_text += "\n".join([f"• {channel}" for channel in invalid_channels])
+            
+            success_text += f"\n\n🎯 Теперь бот будет пересылать сообщения из этих каналов через ПРИВАТНЫЙ канал-посредник!"
+            
+            await update.message.reply_text(
+                success_text,
+                reply_markup=self.get_main_keyboard()
+            )
+            
+        except Exception as e:
+            logger.error(f"Ошибка обработки каналов для чата {chat_id}: {e}")
+            await update.message.reply_text(
+                f"❌ Ошибка обработки каналов: {e}",
+                reply_markup=self.get_main_keyboard()
+            )
+
+    def process_channel_input(self, channel_input: str) -> str:
+        """Обработка одного канала"""
+        channel_input = channel_input.strip()
+        
+        if channel_input.startswith('https://t.me/'):
+            channel_input = channel_input.replace('https://t.me/', '')
+        elif channel_input.startswith('t.me/'):
+            channel_input = channel_input.replace('t.me/', '')
+        
+        if channel_input.startswith('/'):
+            channel_input = channel_input[1:]
+        
+        if channel_input.startswith('@'):
+            channel_input = channel_input[1:]
+        
+        if not channel_input or len(channel_input) < 3:
+            return None
+        
+        if any(char in channel_input for char in [' ', '/', '\\', '?', '#']):
+            return None
+        
+        return f"@{channel_input}" if not channel_input.startswith('@') else channel_input
+
+    async def save_channels_for_chat(self, chat_id, channels):
+        """Сохранение каналов для чата"""
+        try:
+            chat_folder = f"data/chats/{chat_id}"
+            os.makedirs(chat_folder, exist_ok=True)
+            
+            chat_data_path = f"{chat_folder}/chat_data.json"
+            
+            chat_data = await self.channel_monitor._safe_json_load(chat_data_path)
+            if chat_data is None:
+                chat_data = {
                     'channels': [],
                     'created_at': datetime.now().isoformat(),
                     'updated_at': datetime.now().isoformat(),
                     'total_processed': 0,
-                    'total_sent': 0
+                    'total_sent': 0,
+                    'chat_type': 'private'
                 }
             
-            if stat_type == 'sent':
-                user_data['total_sent'] = user_data.get('total_sent', 0) + 1
+            existing_channels = set(chat_data['channels'])
+            new_channels = [ch for ch in channels if ch not in existing_channels]
             
-            user_data['updated_at'] = datetime.now().isoformat()
+            chat_data['channels'].extend(new_channels)
+            chat_data['updated_at'] = datetime.now().isoformat()
             
-            await self.channel_monitor._safe_json_save(user_data_path, user_data)
+            await self.channel_monitor._safe_json_save(chat_data_path, chat_data)
+            
+            logger.info(f"✅ Сохранено {len(new_channels)} новых каналов для чата {chat_id}")
+            
         except Exception as e:
-            logger.error(f"Error updating stats for user {user_id}: {e}")
-    
-    async def cleanup_archive(self):
-        """Очистка архива"""
-        while True:
-            try:
-                if not os.path.exists('data/users'):
-                    await asyncio.sleep(CONSTANTS['archive_cleanup_interval'])
-                    continue
-                    
-                users_folders = os.listdir('data/users')
-                for user_folder in users_folders:
-                    user_id = user_folder
-                    archive_path = f"data/users/{user_id}/archive.json"
-                    
-                    archive = await self.channel_monitor._safe_json_load(archive_path) or []
-                    
-                    now = datetime.now()
-                    updated_archive = []
-                    
-                    for archived_item in archive:
-                        try:
-                            archived_time = datetime.fromisoformat(archived_item['archived_at'])
-                            if (now - archived_time).days < CONSTANTS['archive_ttl_days']:
-                                updated_archive.append(archived_item)
-                        except Exception as e:
-                            logger.error(f"Error processing archive item: {e}")
-                            continue
-                    
-                    if len(updated_archive) != len(archive):
-                        await self.channel_monitor._safe_json_save(archive_path, updated_archive)
-                
-                await asyncio.sleep(CONSTANTS['archive_cleanup_interval'])
-            except Exception as e:
-                logger.error(f"Error cleaning archive: {e}")
-                await asyncio.sleep(3600)
-    
-    async def restore_channel_monitoring(self):
-        """Восстановление отслеживания каналов после перезагрузки бота"""
+            logger.error(f"❌ Ошибка сохранения каналов для чата {chat_id}: {e}")
+            raise
+
+    async def create_chat_files(self, chat_id, chat_type):
+        """Создание файлов для нового чата"""
         try:
-            logger.info("🔄 Восстанавливаю отслеживание каналов для всех пользователей...")
+            chat_folder = f"data/chats/{chat_id}"
+            os.makedirs(chat_folder, exist_ok=True)
             
-            if not os.path.exists('data/users'):
-                logger.info("📁 Нет данных пользователей для восстановления")
+            chat_data_path = f"{chat_folder}/chat_data.json"
+            queue_path = f"{chat_folder}/queue.json"
+            archive_path = f"{chat_folder}/archive.json"
+            
+            if not os.path.exists(chat_data_path):
+                chat_data = {
+                    'channels': [],
+                    'created_at': datetime.now().isoformat(),
+                    'updated_at': datetime.now().isoformat(),
+                    'total_processed': 0,
+                    'total_sent': 0,
+                    'chat_type': chat_type
+                }
+                await self.channel_monitor._safe_json_save(chat_data_path, chat_data)
+            
+            if not os.path.exists(queue_path):
+                await self.channel_monitor._safe_json_save(queue_path, [])
+            
+            if not os.path.exists(archive_path):
+                await self.channel_monitor._safe_json_save(archive_path, [])
+                
+            logger.info(f"✅ Созданы файлы для чата {chat_id}")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания файлов для чата {chat_id}: {e}")
+
+    async def restore_channel_monitoring(self):
+        """Восстановление отслеживания каналов после перезагрузки"""
+        try:
+            logger.info("🔄 Восстанавливаю отслеживание каналов для всех чатов...")
+            
+            if not os.path.exists('data/chats'):
+                logger.info("📁 Нет данных чатов для восстановления")
                 return
                 
-            users_folders = os.listdir('data/users')
+            chat_folders = os.listdir('data/chats')
             total_channels = 0
             
-            for user_folder in users_folders:
+            for chat_folder in chat_folders:
                 try:
-                    user_id = user_folder
-                    user_data_path = f"data/users/{user_id}/user_data.json"
+                    chat_id = int(chat_folder)
+                    chat_data_path = f"data/chats/{chat_folder}/chat_data.json"
                     
-                    user_data = await self.channel_monitor._safe_json_load(user_data_path)
-                    if user_data and user_data.get('channels'):
-                        channels = user_data['channels']
+                    chat_data = await self.channel_monitor._safe_json_load(chat_data_path)
+                    if chat_data and chat_data.get('channels'):
+                        channels = chat_data['channels']
                         if channels:
-                            await self.channel_monitor.add_user_channels(user_id, channels)
+                            await self.channel_monitor.add_channel_monitoring(chat_id, channels)
                             total_channels += len(channels)
-                            logger.info(f"   ✅ Восстановлено {len(channels)} каналов для пользователя {user_id}")
+                            logger.info(f"   ✅ Восстановлено {len(channels)} каналов для чата {chat_id}")
                             
                 except Exception as e:
-                    logger.error(f"❌ Ошибка восстановления каналов для пользователя {user_folder}: {e}")
+                    logger.error(f"❌ Ошибка восстановления каналов для чата {chat_folder}: {e}")
                     continue
                     
-            logger.info(f"✅ Восстановление завершено: {total_channels} каналов для {len(users_folders)} пользователей")
+            logger.info(f"✅ Восстановление завершено: {total_channels} каналов для {len(chat_folders)} чатов")
             
         except Exception as e:
             logger.error(f"❌ Ошибка при восстановлении отслеживания каналов: {e}")
-    
-    async def shutdown(self):
-        """Завершение работы"""
-        logger.info("Завершение работы бота...")
+
+    async def start_monitoring(self):
+        """Запуск мониторинга каналов"""
         try:
-            await self.channel_monitor.stop()
-            await self.application.shutdown()
+            await self.channel_monitor.start()
+            logger.info("✅ Мониторинг каналов запущен")
+            
+            await self.restore_channel_monitoring()
+            
         except Exception as e:
-            logger.error(f"Error during shutdown: {e}")
-        finally:
-            logger.info("Бот завершил работу")
-    
+            logger.error(f"❌ Ошибка запуска мониторинга: {e}")
+            raise
+
+    async def shutdown(self):
+        """Graceful shutdown"""
+        logger.info("🛑 Завершение работы бота...")
+        
+        await self.channel_monitor.stop()
+        
+        if self.application:
+            await self.application.stop()
+            await self.application.shutdown()
+        
+        logger.info("👋 Бот завершил работу")
+
+    async def process_queue_loop(self):
+        """Цикл обработки очереди"""
+        while True:
+            try:
+                await self.process_all_queues()
+                await asyncio.sleep(CONSTANTS['queue_processing_interval'])
+            except Exception as e:
+                logger.error(f"❌ Ошибка в цикле обработки очереди: {e}")
+                await asyncio.sleep(60)
+
+    async def process_all_queues(self):
+        """Обработка всех очередей чатов"""
+        try:
+            if not os.path.exists('data/chats'):
+                return
+            
+            for chat_folder in os.listdir('data/chats'):
+                chat_id = chat_folder
+                queue_path = f"data/chats/{chat_folder}/queue.json"
+                
+                if os.path.exists(queue_path):
+                    await self.process_chat_queue(chat_id)
+                    
+        except Exception as e:
+            logger.error(f"❌ Ошибка обработки всех очередей: {e}")
+
+    async def process_chat_queue(self, chat_id: str):
+        """Обработка очереди конкретного чата"""
+        try:
+            queue_path = f"data/chats/{chat_id}/queue.json"
+            archive_path = f"data/chats/{chat_id}/archive.json"
+            
+            queue = await self.channel_monitor._safe_json_load(queue_path) or []
+            archive = await self.channel_monitor._safe_json_load(archive_path) or []
+            
+            if not queue:
+                return
+            
+            queue.sort(key=lambda x: x.get('interest_score', 0), reverse=True)
+            
+            top_posts = queue[:CONSTANTS['max_posts_per_batch']]
+            
+            sent_count = 0
+            for post in top_posts:
+                try:
+                    success = await self.forward_via_private_channel(int(chat_id), post)
+                    
+                    if success:
+                        archive.append(post)
+                        sent_count += 1
+                        logger.info(f"✅ Переслан пост в чат {chat_id} через приватный канал")
+                        
+                        await asyncio.sleep(1)
+                    else:
+                        logger.warning(f"⚠️ Не удалось переслать пост в чат {chat_id}")
+                        
+                except Exception as e:
+                    logger.error(f"❌ Ошибка пересылки поста в чат {chat_id}: {e}")
+            
+            remaining_queue = queue[CONSTANTS['max_posts_per_batch']:]
+            
+            await self.channel_monitor._safe_json_save(queue_path, remaining_queue)
+            await self.channel_monitor._safe_json_save(archive_path, archive)
+            
+            if sent_count > 0:
+                await self.update_chat_sent_stats(int(chat_id), sent_count)
+            
+            logger.info(f"📤 Обработана очередь чата {chat_id}: отправлено {sent_count} постов, осталось {len(remaining_queue)}")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка обработки очереди чата {chat_id}: {e}")
+
+    async def forward_via_private_channel(self, chat_id: int, post_data: dict) -> bool:
+        """Пересылка сообщения через приватный канал-посредник с улучшенной обработкой ошибок"""
+        try:
+            logger.info(f"🔄 Начинаем пересылку для чата {chat_id} через приватный канал...")
+            
+            if not self.channel_monitor.telethon_client or not self.channel_monitor.telethon_client.is_connected():
+                logger.error("❌ Telethon клиент не подключен")
+                return False
+
+            # Проверяем доступ к приватному каналу
+            try:
+                logger.info(f"🔍 Проверяем доступ к приватному каналу {self.channel_monitor.intermediate_channel_id}...")
+                channel_entity = await self.channel_monitor.telethon_client.get_entity(
+                    self.channel_monitor.intermediate_channel_id
+                )
+                logger.info(f"✅ Доступ к каналу подтвержден: {getattr(channel_entity, 'title', 'Unknown')}")
+            except Exception as e:
+                logger.error(f"❌ Ошибка доступа к приватному каналу: {e}")
+                logger.error("Убедитесь, что:")
+                logger.error("1. Канал существует и является приватным")
+                logger.error("2. Бот добавлен в канал как администратор")
+                logger.error("3. Указан правильный channel_id")
+                return False
+
+            # Получаем оригинальное сообщение
+            logger.info(f"📨 Получаем оригинальное сообщение {post_data['original_message_id']}...")
+            original_message = await self.channel_monitor.telethon_client.get_messages(
+                post_data['original_channel_id'],
+                ids=post_data['original_message_id']
+            )
+            
+            if not original_message:
+                logger.error(f"❌ Не удалось получить сообщение {post_data['original_message_id']} из канала {post_data['original_channel_id']}")
+                return False
+
+            logger.info("✅ Оригинальное сообщение получено")
+
+            # Пересылаем сообщение в приватный канал-посредник
+            logger.info("🔄 Пересылаем сообщение в приватный канал...")
+            try:
+                forwarded_message = await self.channel_monitor.telethon_client.forward_messages(
+                    entity=self.channel_monitor.intermediate_channel_id,
+                    messages=original_message,
+                    from_peer=post_data['original_channel_id']
+                )
+                
+                if not forwarded_message:
+                    logger.error("❌ Не удалось переслать сообщение в приватный канал")
+                    return False
+                    
+                logger.info("✅ Сообщение переслано в приватный канал")
+
+            except Exception as e:
+                logger.error(f"❌ Ошибка пересылки в приватный канал: {e}")
+                logger.error("Проверьте права бота в приватном канале")
+                return False
+
+            # Получаем ID пересланного сообщения в приватном канале
+            if hasattr(forwarded_message, 'id'):
+                intermediate_message_id = forwarded_message.id
+            elif isinstance(forwarded_message, list) and len(forwarded_message) > 0:
+                intermediate_message_id = forwarded_message[0].id
+            else:
+                logger.error("❌ Не удалось получить ID пересланного сообщения")
+                return False
+
+            logger.info(f"📝 ID сообщения в приватном канале: {intermediate_message_id}")
+
+            # Пересылаем из приватного канала в целевой чат через Bot API
+            logger.info(f"🔄 Пересылаем из приватного канала в чат {chat_id}...")
+            try:
+                await self.application.bot.forward_message(
+                    chat_id=chat_id,
+                    from_chat_id=self.channel_monitor.intermediate_channel_id,
+                    message_id=intermediate_message_id
+                )
+                
+                logger.info(f"✅ Сообщение успешно переслано через приватный канал в чат {chat_id}")
+                return True
+
+            except Exception as e:
+                logger.error(f"❌ Ошибка пересылки в чат {chat_id}: {e}")
+                logger.error("Проверьте:")
+                logger.error(f"1. Бот добавлен в чат {chat_id}")
+                logger.error("2. Бот имеет права на отправку сообщений в чат")
+                return False
+
+        except Exception as e:
+            logger.error(f"❌ Критическая ошибка пересылки через приватный канал: {e}")
+            return False
+
+    async def update_chat_sent_stats(self, chat_id: int, sent_count: int):
+        """Обновление статистики отправленных постов"""
+        try:
+            chat_data_path = f"data/chats/{chat_id}/chat_data.json"
+            
+            chat_data = await self.channel_monitor._safe_json_load(chat_data_path)
+            if chat_data is None:
+                return
+            
+            chat_data['total_sent'] = chat_data.get('total_sent', 0) + sent_count
+            chat_data['updated_at'] = datetime.now().isoformat()
+            
+            await self.channel_monitor._safe_json_save(chat_data_path, chat_data)
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка обновления статистики отправки для чата {chat_id}: {e}")
+
+    async def cleanup_archive_loop(self):
+        """Цикл очистки архива"""
+        while True:
+            try:
+                await self.cleanup_all_archives()
+                await asyncio.sleep(CONSTANTS['archive_cleanup_interval'])
+            except Exception as e:
+                logger.error(f"❌ Ошибка в цикле очистки архива: {e}")
+                await asyncio.sleep(3600)
+
+    async def cleanup_all_archives(self):
+        """Очистка архивов всех чатов"""
+        try:
+            if not os.path.exists('data/chats'):
+                return
+            
+            cutoff_time = datetime.now() - timedelta(days=CONSTANTS['archive_ttl_days'])
+            
+            for chat_folder in os.listdir('data/chats'):
+                archive_path = f"data/chats/{chat_folder}/archive.json"
+                
+                if os.path.exists(archive_path):
+                    await self.cleanup_chat_archive(chat_folder, archive_path, cutoff_time)
+                    
+        except Exception as e:
+            logger.error(f"❌ Ошибка очистки архивов: {e}")
+
+    async def cleanup_chat_archive(self, chat_id: str, archive_path: str, cutoff_time: datetime):
+        """Очистка архива конкретного чата"""
+        try:
+            archive = await self.channel_monitor._safe_json_load(archive_path) or []
+            
+            if not archive:
+                return
+            
+            cleaned_archive = []
+            removed_count = 0
+            
+            for post in archive:
+                try:
+                    post_time = datetime.fromisoformat(post.get('timestamp', '2000-01-01'))
+                    if post_time > cutoff_time:
+                        cleaned_archive.append(post)
+                    else:
+                        removed_count += 1
+                except:
+                    cleaned_archive.append(post)
+            
+            if removed_count > 0:
+                await self.channel_monitor._safe_json_save(archive_path, cleaned_archive)
+                logger.info(f"🧹 Очищен архив чата {chat_id}: удалено {removed_count} старых постов")
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка очистки архива чата {chat_id}: {e}")
+
     async def run(self):
         """Запуск бота"""
-        logger.info("🚀 Starting News Aggregator Bot...")
-        logger.info("📝 Включено детальное логирование всех постов из каналов!")
-        
         try:
-            # Запуск фоновых задач
-            asyncio.create_task(self.process_queue())
-            asyncio.create_task(self.cleanup_archive())
+            logger.info("🚀 Запуск All News Bot...")
             
-            # Запуск бота
+            await self.start_monitoring()
+            
+            asyncio.create_task(self.process_queue_loop())
+            asyncio.create_task(self.cleanup_archive_loop())
+            
+            logger.info("🤖 Бот запускается...")
             await self.application.initialize()
             await self.application.start()
-            await self.application.updater.start_polling()
+            await self.application.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True
+            )
             
-            logger.info("✅ Бот успешно запущен!")
-            
-            # Запуск мониторинга
-            try:
-                await self.channel_monitor.start()
-                logger.info("🎯 Мониторинг каналов: АКТИВЕН")
-                
-                # ВОССТАНОВЛЕНИЕ ОТСЛЕЖИВАНИЯ КАНАЛОВ ПОСЛЕ ПЕРЕЗАГРУЗКИ
-                await self.restore_channel_monitoring()
-                
-                logger.info("📨 Режим пересылки сообщений: ВКЛЮЧЕН")
-                logger.info("🔍 Детальное логирование: ВКЛЮЧЕНО")
-            except Exception as e:
-                logger.error(f"❌ Мониторинг не запущен: {e}")
-                logger.info("💡 Для включения мониторинга нужно авторизоваться через setup_monitor.py")
+            logger.info("✅ Бот успешно запущен и готов к работе!")
             
             while True:
-                await asyncio.sleep(3600)
+                await asyncio.sleep(1)
                 
         except Exception as e:
-            logger.error(f"Error running bot: {e}")
-        finally:
+            logger.error(f"❌ Критическая ошибка при запуске бота: {e}")
             await self.shutdown()
 
-def main():
-    """Главная функция"""
+async def main():
+    """Основная функция"""
+    bot = NewsBot()
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        bot = NewsBot()
-        loop.run_until_complete(bot.run())
-        
+        await bot.run()
     except KeyboardInterrupt:
         logger.info("Получен сигнал KeyboardInterrupt")
+        await bot.shutdown()
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
-    finally:
-        logger.info("Программа завершена")
+        logger.error(f"Критическая ошибка: {e}")
+        await bot.shutdown()
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    os.makedirs('config', exist_ok=True)
+    os.makedirs('data/chats', exist_ok=True)
+    os.makedirs('session', exist_ok=True)
+    
+    if not os.path.exists('config/tg_config.json'):
+        logger.error("❌ Файл config/tg_config.json не найден!")
+        logger.info("📝 Создайте файл с следующими полями:")
+        logger.info('''
+{
+    "bot_token": "YOUR_BOT_TOKEN",
+    "api_id": 12345678,
+    "api_hash": "YOUR_API_HASH"
+}
+        ''')
+        sys.exit(1)
+        
+    if not os.path.exists('config/channel_config.json'):
+        logger.error("❌ Файл config/channel_config.json не найден!")
+        logger.info("📝 Создайте файл с следующими полями:")
+        logger.info('''
+{
+    "channel_id": -1001234567890
+}
+        ''')
+        logger.info("💡 Инструкция по настройке приватного канала:")
+        logger.info("1. Создайте ПРИВАТНЫЙ канал в Telegram")
+        logger.info("2. Добавьте бота в канал как администратора")
+        logger.info("3. Дайте боту права на отправку сообщений")
+        logger.info("4. Получите ID канала (отрицательное число)")
+        logger.info("5. Укажите ID в channel_config.json")
+        sys.exit(1)
+    
+    asyncio.run(main())
