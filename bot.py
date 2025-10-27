@@ -403,6 +403,13 @@ class ChannelMonitor:
         try:
             logger.info(f"🎯 ПОЛУЧЕНО СООБЩЕНИЕ ИЗ КАНАЛА ДЛЯ ЧАТА {chat_id}")
             
+            # Проверяем, активен ли бот для этого чата
+            chat_data_path = f"data/chats/{chat_id}/chat_data.json"
+            chat_data = await self._safe_json_load(chat_data_path)
+            if chat_data and not chat_data.get('is_active', True):
+                logger.info(f"   ⏸️ Бот неактивен для чата {chat_id}, пропускаем сообщение")
+                return
+            
             # Пропускаем сообщения без текста (только медиа)
             if not message.text and not message.message:
                 logger.info("   📭 Сообщение без текста (только медиа) - пропускаем")
@@ -563,7 +570,8 @@ class ChannelMonitor:
                     'updated_at': datetime.now().isoformat(),
                     'total_processed': 0,
                     'total_sent': 0,
-                    'chat_type': 'unknown'
+                    'chat_type': 'unknown',
+                    'is_active': True
                 }
             
             if stat_type == 'processed':
@@ -618,11 +626,8 @@ class NewsBot:
         self.application.add_handler(CommandHandler("add_channels", self.add_channels_handler))
         self.application.add_handler(CommandHandler("my_channels", self.my_channels_handler))
         self.application.add_handler(CommandHandler("remove_channels", self.remove_channels_handler))
-        self.application.add_handler(CommandHandler("stats", self.stats_handler))
-        self.application.add_handler(CommandHandler("test_post", self.test_post_handler))
-        self.application.add_handler(CommandHandler("monitor_status", self.monitor_status_handler))
+        self.application.add_handler(CommandHandler("stop", self.stop_handler))
         self.application.add_handler(CommandHandler("help", self.help_handler))
-        self.application.add_handler(CommandHandler("debug", self.debug_handler))
         
         # Обработчик callback query ДОЛЖЕН БЫТЬ ПЕРВЫМ среди callback handlers
         self.application.add_handler(CallbackQueryHandler(self.callback_handler, pattern="^rm_"))
@@ -812,84 +817,62 @@ class NewsBot:
             
             if success:
                 channels_list = "\n".join([f"• {channel}" for channel in channels_to_remove])
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"✅ **Удалены каналы:**\n\n{channels_list}\n\n"
-                        f"🗑️ Удалено: {len(channels_to_remove)} каналов",
-                    reply_markup=self.get_main_keyboard()
+                await query.edit_message_text(
+                    f"✅ **Каналы успешно удалены:**\n\n{channels_list}\n\n"
+                    f"Теперь эти каналы больше не отслеживаются."
                 )
             else:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text="❌ Произошла ошибка при удалении каналов",
-                    reply_markup=self.get_main_keyboard()
+                await query.edit_message_text(
+                    "❌ **Ошибка при удалении каналов**\n\n"
+                    "Попробуйте еще раз или обратитесь к администратору."
                 )
             
-            # Очищаем данные
-            self._cleanup_remove_data(context)
-            
+            # Очищаем временные данные
+            if 'remove_channels' in context.chat_data:
+                del context.chat_data['remove_channels']
+                
         except Exception as e:
-            logger.error(f"❌ Ошибка в _handle_confirm_remove: {e}")
-            try:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text="❌ Произошла ошибка при удалении каналов",
-                    reply_markup=self.get_main_keyboard()
-                )
-            except Exception as send_error:
-                logger.error(f"❌ Не удалось отправить сообщение об ошибке: {send_error}")
-            finally:
-                self._cleanup_remove_data(context)
-    
+            logger.error(f"❌ Ошибка подтверждения удаления: {e}")
+            await query.edit_message_text(
+                "❌ **Произошла ошибка при удалении каналов**\n\n"
+                "Попробуйте еще раз или обратитесь к администратору."
+            )
+
     async def _handle_cancel_remove(self, query, context):
         """Обработка отмены удаления"""
         try:
-            # Убираем клавиатуру
-            empty_keyboard = InlineKeyboardMarkup([])
-            await query.edit_message_text(
-                "❌ Удаление каналов отменено",
-                reply_markup=empty_keyboard
-            )
+            # Очищаем временные данные
+            if 'remove_channels' in context.chat_data:
+                del context.chat_data['remove_channels']
+            
+            await query.edit_message_text("❌ Удаление каналов отменено.")
+            
         except Exception as e:
-            logger.error(f"❌ Ошибка при отмене: {e}")
-        finally:
-            self._cleanup_remove_data(context)
+            logger.error(f"❌ Ошибка отмены удаления: {e}")
+            await query.answer("❌ Ошибка отмены", show_alert=True)
 
     async def _handle_callback_error(self, query, context, chat_id):
         """Обработка ошибок callback"""
         try:
-            # Убираем клавиатуру при ошибке
-            empty_keyboard = InlineKeyboardMarkup([])
             await query.edit_message_text(
-                "❌ Произошла ошибка. Попробуйте снова.",
-                reply_markup=empty_keyboard
+                "❌ **Произошла ошибка**\n\n"
+                "Попробуйте выполнить команду заново."
             )
         except Exception as e:
-            logger.error(f"❌ Не удалось редактировать сообщение об ошибке: {e}")
+            logger.error(f"❌ Ошибка отправки сообщения об ошибке: {e}")
             try:
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text="❌ Произошла ошибка. Попробуйте снова.",
-                    reply_markup=self.get_main_keyboard()
+                    text="❌ Произошла ошибка. Попробуйте выполнить команду заново."
                 )
-            except Exception as send_error:
-                logger.error(f"❌ Не удалось отправить сообщение об ошибке: {send_error}")
-        finally:
-            self._cleanup_remove_data(context)
+            except Exception as e2:
+                logger.error(f"❌ Критическая ошибка отправки сообщения: {e2}")
 
-    def _cleanup_remove_data(self, context):
-        """Очистка временных данных"""
-        keys_to_remove = ['remove_channels', 'remove_message_id']
-        for key in keys_to_remove:
-            if key in context.chat_data:
-                del context.chat_data[key]
-    
     def get_main_keyboard(self):
         """Клавиатура с основными командами"""
         keyboard = [
             [KeyboardButton("/add_channels"), KeyboardButton("/my_channels")],
-            [KeyboardButton("/stats"), KeyboardButton("/remove_channels")],
-            [KeyboardButton("/test_post"), KeyboardButton("/monitor_status")],
+            [KeyboardButton("/remove_channels"), KeyboardButton("/stop")],
             [KeyboardButton("/help")]
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, input_field_placeholder="Выберите команду...")
@@ -922,11 +905,8 @@ class NewsBot:
 • /add_channels - добавить каналы
 • /my_channels - мои каналы  
 • /remove_channels - удалить каналы
-• /stats - статистика
-• /test_post - тест нейросетей
-• /monitor_status - статус мониторинга
+• /stop - остановить отправку новостей
 • /help - помощь
-• /debug - отладочная информация
 
 💡 **Бот теперь пересылает оригинальные сообщения через ПРИВАТНЫЙ канал-посредник!**
         """
@@ -936,42 +916,40 @@ class NewsBot:
             reply_markup=self.get_main_keyboard()
         )
     
-    async def debug_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Отладочная информация"""
+    async def stop_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Остановка отправки новостей"""
         chat_id = update.effective_chat.id
         
-        debug_info = f"""
-🔧 **Отладочная информация**
-
-📊 Мониторинг:
-• Статус: {'🟢 Активен' if self.channel_monitor.is_running else '🔴 Неактивен'}
-• Отслеживаемых каналов: {len(self.channel_monitor.monitored_channels)}
-• Обработчиков чатов: {len(self.channel_monitor.channel_handlers)}
-• Приватный канал: {self.channel_monitor.intermediate_channel_title}
-• ID канала: {self.channel_monitor.intermediate_channel_id}
-
-📋 Ваши каналы:
-"""
-        
-        chat_data = await self.channel_monitor._safe_json_load(f"data/chats/{chat_id}/chat_data.json")
-        if chat_data and chat_data.get('channels'):
-            for channel in chat_data['channels']:
-                debug_info += f"• {channel}\n"
-        else:
-            debug_info += "• Нет каналов\n"
+        try:
+            chat_data_path = f"data/chats/{chat_id}/chat_data.json"
+            chat_data = await self.channel_monitor._safe_json_load(chat_data_path)
             
-        debug_info += f"""
-🎮 Нейросети:
-• Устройство: {'🎮 GPU' if str(DEVICE) == 'cuda' else '💻 CPU'}
-• Модели загружены: ✅
-
-💬 Режим: {'👤 Личные сообщения' if update.effective_chat.type == 'private' else '👥 Группа'}
-        """
-        
-        await update.message.reply_text(
-            debug_info,
-            reply_markup=self.get_main_keyboard()
-        )
+            if chat_data:
+                chat_data['is_active'] = False
+                chat_data['updated_at'] = datetime.now().isoformat()
+                await self.channel_monitor._safe_json_save(chat_data_path, chat_data)
+                
+                await update.message.reply_text(
+                    "⏸️ **Бот остановлен**\n\n"
+                    "Я больше не буду присылать новости в этот чат.\n"
+                    "Чтобы возобновить получение новостей, используйте команду /start\n\n"
+                    "ℹ️ Все ваши настройки и каналы сохранены.",
+                    reply_markup=self.get_main_keyboard()
+                )
+                logger.info(f"🛑 Бот остановлен для чата {chat_id}")
+            else:
+                await update.message.reply_text(
+                    "❌ **Чат не найден**\n\n"
+                    "Сначала запустите бота с помощью /start",
+                    reply_markup=self.get_main_keyboard()
+                )
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка остановки бота для чата {chat_id}: {e}")
+            await update.message.reply_text(
+                "❌ Произошла ошибка при остановке бота. Попробуйте еще раз.",
+                reply_markup=self.get_main_keyboard()
+            )
     
     async def help_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Справка по командам"""
@@ -982,12 +960,7 @@ class NewsBot:
 `/add_channels` - добавить каналы для отслеживания
 `/my_channels` - показать мои каналы
 `/remove_channels` - удалить каналы из отслеживания
-
-📊 **Информация:**
-`/stats` - статистика и метрики
-`/monitor_status` - статус мониторинга
-`/test_post` - тест работы нейросетей
-`/debug` - отладочная информация
+`/stop` - остановить отправку новостей
 
 ❓ **Помощь:**
 `/help` - показать это сообщение
@@ -1042,7 +1015,10 @@ https://t.me/*channel*
         if chat_data and chat_data.get('channels'):
             channels = chat_data.get('channels', [])
             channels_text = "\n".join([f"• {channel}" for channel in channels])
-            message = f"📋 **Ваши отслеживаемые каналы** ({len(channels)}):\n\n{channels_text}\n\n💡 Используйте /remove_channels чтобы удалить каналы"
+            
+            status = "🟢 Активен" if chat_data.get('is_active', True) else "⏸️ Остановлен"
+            
+            message = f"📋 **Ваши отслеживаемые каналы** ({len(channels)}):\n\n{channels_text}\n\n**Статус бота:** {status}\n\n💡 Используйте /remove_channels чтобы удалить каналы"
         else:
             message = "❌ У вас нет отслеживаемых каналов.\n\n💡 Добавьте каналы командой /add_channels"
         
@@ -1093,118 +1069,6 @@ https://t.me/*channel*
                 "❌ Произошла ошибка при загрузке каналов",
                 reply_markup=self.get_main_keyboard()
             )
-
-    async def stats_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Статистика и метрики"""
-        chat_id = update.effective_chat.id
-        
-        chat_data = await self.channel_monitor._safe_json_load(f"data/chats/{chat_id}/chat_data.json")
-        
-        if chat_data:
-            channels_count = len(chat_data.get('channels', []))
-            total_processed = chat_data.get('total_processed', 0)
-            total_sent = chat_data.get('total_sent', 0)
-            created_at = chat_data.get('created_at', 'неизвестно')
-            updated_at = chat_data.get('updated_at', 'неизвестно')
-            
-            stats_text = f"""
-📊 **Статистика для этого чата**
-
-📋 **Каналы:**
-• Отслеживаемых каналов: {channels_count}
-• Обработано сообщений: {total_processed}
-• Отправлено в чат: {total_sent}
-
-📅 **Время:**
-• Создан: {created_at[:16]}
-• Обновлен: {updated_at[:16]}
-
-🎯 **Мониторинг:**
-• Статус: {'🟢 Активен' if self.channel_monitor.is_running else '🔴 Неактивен'}
-• Отслеживаемых каналов (всего): {len(self.channel_monitor.monitored_channels)}
-• Приватный канал: {self.channel_monitor.intermediate_channel_title}
-
-💡 **Режим пересылки:** 📨 Через приватный канал
-            """
-        else:
-            stats_text = "❌ Статистика недоступна. Используйте /start для инициализации."
-        
-        await update.message.reply_text(
-            stats_text,
-            reply_markup=self.get_main_keyboard()
-        )
-
-    async def test_post_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Тестирование работы нейросетей"""
-        chat_id = update.effective_chat.id
-        
-        test_text = """
-        Важная новость: Центробанк принял решение о ключевой ставке. 
-        Эксперты ожидают изменений в финансовой политике на фоне текущей экономической ситуации.
-        """
-        
-        await update.message.reply_text("🧠 **Тестирование нейросетей...**")
-        
-        try:
-            fingerprint = self.neural_processor.create_fingerprint(test_text)
-            interest_score = self.neural_processor.calculate_interest_score(test_text)
-            
-            test_results = f"""
-✅ **Тест нейросетей завершен**
-
-📝 **Тестовый текст:**
-"{test_text[:100]}..."
-
-🔑 **Цифровой отпечаток:**
-{fingerprint[:32]}...
-
-⭐ **Оценка интересности:**
-{interest_score:.2f}/1.0
-
-🎯 **Интерпретация:**
-• Отпечаток: уникальный идентификатор текста
-• Оценка: вероятность того, что текст является новостью
-            """
-            
-            await update.message.reply_text(
-                test_results,
-                reply_markup=self.get_main_keyboard()
-            )
-            
-        except Exception as e:
-            logger.error(f"Ошибка тестирования нейросетей: {e}")
-            await update.message.reply_text(
-                f"❌ Ошибка тестирования: {e}",
-                reply_markup=self.get_main_keyboard()
-            )
-
-    async def monitor_status_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Статус мониторинга каналов"""
-        chat_id = update.effective_chat.id
-        
-        status_text = f"""
-📡 **Статус мониторинга каналов**
-
-🔄 **Общий статус:**
-• Мониторинг: {'🟢 АКТИВЕН' if self.channel_monitor.is_running else '🔴 НЕАКТИВЕН'}
-• Всего отслеживаемых каналов: {len(self.channel_monitor.monitored_channels)}
-• Активных обработчиков: {len(self.channel_monitor.channel_handlers)}
-
-📊 **Ваши данные:**
-• Ваш chat_id: {chat_id}
-• Ваши каналы: {len(self.channel_monitor._safe_json_load_sync(f'data/chats/{chat_id}/chat_data.json').get('channels', [])) if os.path.exists(f'data/chats/{chat_id}/chat_data.json') else 0}
-
-🎮 **Техническая информация:**
-• Устройство нейросетей: {'🎮 GPU' if str(DEVICE) == 'cuda' else '💻 CPU'}
-• Приватный канал: {self.channel_monitor.intermediate_channel_title}
-• ID канала: {self.channel_monitor.intermediate_channel_id}
-• Режим пересылки: 📨 Через приватный канал
-            """
-        
-        await update.message.reply_text(
-            status_text,
-            reply_markup=self.get_main_keyboard()
-        )
 
     async def message_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик текстовых сообщений"""
@@ -1321,7 +1185,8 @@ https://t.me/*channel*
                     'updated_at': datetime.now().isoformat(),
                     'total_processed': 0,
                     'total_sent': 0,
-                    'chat_type': 'private'
+                    'chat_type': 'private',
+                    'is_active': True
                 }
             
             existing_channels = set(chat_data['channels'])
@@ -1355,7 +1220,8 @@ https://t.me/*channel*
                     'updated_at': datetime.now().isoformat(),
                     'total_processed': 0,
                     'total_sent': 0,
-                    'chat_type': chat_type
+                    'chat_type': chat_type,
+                    'is_active': True
                 }
                 await self.channel_monitor._safe_json_save(chat_data_path, chat_data)
             
@@ -1464,6 +1330,13 @@ https://t.me/*channel*
             archive = await self.channel_monitor._safe_json_load(archive_path) or []
             
             if not queue:
+                return
+            
+            # Проверяем активность бота для этого чата
+            chat_data_path = f"data/chats/{chat_id}/chat_data.json"
+            chat_data = await self.channel_monitor._safe_json_load(chat_data_path)
+            if chat_data and not chat_data.get('is_active', True):
+                logger.info(f"⏸️ Бот неактивен для чата {chat_id}, пропускаем обработку очереди")
                 return
             
             queue.sort(key=lambda x: x.get('interest_score', 0), reverse=True)
