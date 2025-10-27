@@ -624,8 +624,8 @@ class NewsBot:
         self.application.add_handler(CommandHandler("help", self.help_handler))
         self.application.add_handler(CommandHandler("debug", self.debug_handler))
         
-        # Обработчик callback query для удаления каналов
-        self.application.add_handler(CallbackQueryHandler(self.callback_handler, pattern="^remove_"))
+        # Обработчик callback query ДОЛЖЕН БЫТЬ ПЕРВЫМ среди callback handlers
+        self.application.add_handler(CallbackQueryHandler(self.callback_handler, pattern="^rm_"))
         
         # Обработчик текстовых сообщений
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.message_handler))
@@ -638,8 +638,9 @@ class NewsBot:
         try:
             # Пропускаем ошибки от пересланных сообщений
             if update and update.effective_message:
-                # Если сообщение переслано из нашего приватного канала - игнорируем ошибку
-                if (update.effective_message.forward_from_chat and 
+                # Безопасная проверка forward_from_chat
+                if (hasattr(update.effective_message, 'forward_from_chat') and 
+                    update.effective_message.forward_from_chat and 
                     update.effective_message.forward_from_chat.id == self.channel_monitor.intermediate_channel_id):
                     logger.debug("🔇 Игнорируем ошибку от пересланного сообщения")
                     return
@@ -671,22 +672,217 @@ class NewsBot:
         except Exception as e:
             logger.error(f"Error in error handler: {e}")
     
+    def _create_channels_keyboard(self, channels, selected_indices):
+        """Создает клавиатуру с каналами в 2 столбца"""
+        keyboard = []
+        
+        # Создаем кнопки каналов в 2 столбца
+        for i in range(0, len(channels), 2):
+            row = []
+            for j in range(2):
+                if i + j < len(channels):
+                    channel_index = i + j
+                    channel = channels[channel_index]
+                    
+                    # Обрезаем длинные названия
+                    display_name = channel
+                    if len(channel) > 15:
+                        display_name = channel[:12] + "..."
+                    
+                    # Определяем эмодзи
+                    emoji = "❌" if channel_index in selected_indices else "✅"
+                    
+                    button = InlineKeyboardButton(
+                        f"{emoji} {display_name}",
+                        callback_data=f"rm_{channel_index}"  # Короткий префикс
+                    )
+                    row.append(button)
+            keyboard.append(row)
+        
+        # Добавляем кнопки действий
+        action_buttons = []
+        if selected_indices:
+            action_buttons.append(InlineKeyboardButton("🚀 Подтвердить", callback_data="rm_confirm"))
+        action_buttons.append(InlineKeyboardButton("❌ Отмена", callback_data="rm_cancel"))
+        keyboard.append(action_buttons)
+        
+        return InlineKeyboardMarkup(keyboard)
+
     async def callback_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик callback query"""
+        """Обработчик callback query для удаления каналов"""
         query = update.callback_query
         await query.answer()
         
         chat_id = update.effective_chat.id
         data = query.data
         
-        if data.startswith("remove_"):
-            channel_to_remove = data.replace("remove_", "")
-            success = await self.channel_monitor.remove_channel_monitoring(chat_id, [channel_to_remove])
+        logger.info(f"📨 Callback получен: {data} для чата {chat_id}")
+        
+        # Обрабатываем только callback'и связанные с удалением каналов
+        if not data.startswith("rm_"):
+            return
+        
+        try:
+            if data == "rm_confirm":
+                await self._handle_confirm_remove(query, context, chat_id)
+                
+            elif data == "rm_cancel":
+                await self._handle_cancel_remove(query, context)
+                
+            elif data.startswith("rm_"):
+                # Извлекаем индекс из callback data
+                index_str = data[3:]  # Убираем "rm_"
+                if index_str.isdigit():
+                    await self._handle_toggle_channel(query, context, chat_id, int(index_str))
+                else:
+                    await query.answer("❌ Ошибка: неверный формат данных", show_alert=True)
+                    
+        except Exception as e:
+            logger.error(f"❌ Ошибка в callback_handler: {e}")
+            await self._handle_callback_error(query, context, chat_id)
+
+    async def _handle_toggle_channel(self, query, context, chat_id, channel_index):
+        """Обработка переключения выбора канала"""
+        remove_data = context.chat_data.get('remove_channels')
+        if not remove_data:
+            await query.answer("❌ Сессия устарела. Начните заново.", show_alert=True)
+            return
+        
+        channels = remove_data['available_channels']
+        selected_indices = remove_data['selected_indices']
+        
+        # Проверяем валидность индекса
+        if channel_index < 0 or channel_index >= len(channels):
+            await query.answer("❌ Ошибка: неверный индекс канала", show_alert=True)
+            return
+        
+        # Переключаем выбор
+        if channel_index in selected_indices:
+            selected_indices.remove(channel_index)
+        else:
+            selected_indices.append(channel_index)
+        
+        # Обновляем клавиатуру
+        keyboard = self._create_channels_keyboard(channels, selected_indices)
+        
+        try:
+            await query.edit_message_text(
+                f"🗑️ **Удаление каналов**\n\n"
+                f"✅ - канал отслеживается\n"
+                f"❌ - канал выбран для удаления\n\n"
+                f"Выберите каналы для удаления:\n\n"
+                f"📊 Выбрано: {len(selected_indices)}/{len(channels)}",
+                reply_markup=keyboard
+            )
+        except Exception as e:
+            logger.error(f"❌ Ошибка обновления сообщения: {e}")
+            await query.answer("❌ Ошибка обновления", show_alert=True)
+
+    async def _handle_confirm_remove(self, query, context, chat_id):
+        """Обработка подтверждения удаления"""
+        try:
+            remove_data = context.chat_data.get('remove_channels')
+            if not remove_data:
+                await query.answer("❌ Сессия устарела. Начните заново.", show_alert=True)
+                return
+            
+            selected_indices = remove_data['selected_indices']
+            channels = remove_data['available_channels']
+            
+            if not selected_indices:
+                await query.answer("❌ Не выбрано ни одного канала", show_alert=True)
+                return
+            
+            # Получаем имена каналов для удаления
+            channels_to_remove = [channels[i] for i in selected_indices if i < len(channels)]
+            
+            if not channels_to_remove:
+                await query.answer("❌ Ошибка: каналы не найдены", show_alert=True)
+                return
+            
+            # Убираем клавиатуру сразу, показываем процесс
+            empty_keyboard = InlineKeyboardMarkup([])
+            await query.edit_message_text(
+                "🔄 Удаляем выбранные каналы...",
+                reply_markup=empty_keyboard
+            )
+            
+            # Удаляем каналы
+            success = await self.channel_monitor.remove_channel_monitoring(chat_id, channels_to_remove)
             
             if success:
-                await query.edit_message_text(f"✅ Канал {channel_to_remove} удален из отслеживания")
+                channels_list = "\n".join([f"• {channel}" for channel in channels_to_remove])
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"✅ **Удалены каналы:**\n\n{channels_list}\n\n"
+                        f"🗑️ Удалено: {len(channels_to_remove)} каналов",
+                    reply_markup=self.get_main_keyboard()
+                )
             else:
-                await query.edit_message_text(f"❌ Не удалось удалить канал {channel_to_remove}")
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="❌ Произошла ошибка при удалении каналов",
+                    reply_markup=self.get_main_keyboard()
+                )
+            
+            # Очищаем данные
+            self._cleanup_remove_data(context)
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка в _handle_confirm_remove: {e}")
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="❌ Произошла ошибка при удалении каналов",
+                    reply_markup=self.get_main_keyboard()
+                )
+            except Exception as send_error:
+                logger.error(f"❌ Не удалось отправить сообщение об ошибке: {send_error}")
+            finally:
+                self._cleanup_remove_data(context)
+    
+    async def _handle_cancel_remove(self, query, context):
+        """Обработка отмены удаления"""
+        try:
+            # Убираем клавиатуру
+            empty_keyboard = InlineKeyboardMarkup([])
+            await query.edit_message_text(
+                "❌ Удаление каналов отменено",
+                reply_markup=empty_keyboard
+            )
+        except Exception as e:
+            logger.error(f"❌ Ошибка при отмене: {e}")
+        finally:
+            self._cleanup_remove_data(context)
+
+    async def _handle_callback_error(self, query, context, chat_id):
+        """Обработка ошибок callback"""
+        try:
+            # Убираем клавиатуру при ошибке
+            empty_keyboard = InlineKeyboardMarkup([])
+            await query.edit_message_text(
+                "❌ Произошла ошибка. Попробуйте снова.",
+                reply_markup=empty_keyboard
+            )
+        except Exception as e:
+            logger.error(f"❌ Не удалось редактировать сообщение об ошибке: {e}")
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="❌ Произошла ошибка. Попробуйте снова.",
+                    reply_markup=self.get_main_keyboard()
+                )
+            except Exception as send_error:
+                logger.error(f"❌ Не удалось отправить сообщение об ошибке: {send_error}")
+        finally:
+            self._cleanup_remove_data(context)
+
+    def _cleanup_remove_data(self, context):
+        """Очистка временных данных"""
+        keys_to_remove = ['remove_channels', 'remove_message_id']
+        for key in keys_to_remove:
+            if key in context.chat_data:
+                del context.chat_data[key]
     
     def get_main_keyboard(self):
         """Клавиатура с основными командами"""
@@ -856,39 +1052,47 @@ https://t.me/*channel*
         )
 
     async def remove_channels_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Удаление каналов из отслеживания"""
+        """Удаление каналов из отслеживания с выбором и подтверждением"""
         chat_id = update.effective_chat.id
         
-        chat_data = await self.channel_monitor._safe_json_load(f"data/chats/{chat_id}/chat_data.json")
-        if not chat_data:
+        try:
+            chat_data = await self.channel_monitor._safe_json_load(f"data/chats/{chat_id}/chat_data.json")
+            if not chat_data or not chat_data.get('channels'):
+                await update.message.reply_text(
+                    "❌ У вас нет отслеживаемых каналов.",
+                    reply_markup=self.get_main_keyboard()
+                )
+                return
+            
+            channels = chat_data.get('channels', [])
+            
+            # Сохраняем каналы в context с индексами
+            context.chat_data['remove_channels'] = {
+                'available_channels': channels,
+                'selected_indices': []
+            }
+            
+            # Создаем начальную клавиатуру
+            keyboard = self._create_channels_keyboard(channels, [])
+            
+            message = await update.message.reply_text(
+                "🗑️ **Удаление каналов**\n\n"
+                "✅ - канал отслеживается\n"
+                "❌ - канал выбран для удаления\n\n"
+                "Выберите каналы для удаления (нажмите на кнопку чтобы выбрать/отменить выбор):"
+                f"\n\n📊 Выбрано: 0/{len(channels)}",
+                reply_markup=keyboard
+            )
+            
+            # Сохраняем ID сообщения для последующих обновлений
+            context.chat_data['remove_message_id'] = message.message_id
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка в remove_channels_handler: {e}")
             await update.message.reply_text(
-                "❌ У вас нет отслеживаемых каналов.",
+                "❌ Произошла ошибка при загрузке каналов",
                 reply_markup=self.get_main_keyboard()
             )
-            return
-        
-        channels = chat_data.get('channels', [])
-        if not channels:
-            await update.message.reply_text(
-                "❌ У вас нет отслеживаемых каналы.",
-                reply_markup=self.get_main_keyboard()
-            )
-            return
-        
-        # Создаем клавиатуру с каналами для удаления
-        keyboard = []
-        for channel in channels:
-            keyboard.append([InlineKeyboardButton(f"❌ {channel}", callback_data=f"remove_{channel}")])
-        
-        keyboard.append([InlineKeyboardButton("✅ Завершить удаление", callback_data="remove_done")])
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            "🗑️ **Удаление каналов**\n\n"
-            "Выберите каналы для удаления:",
-            reply_markup=reply_markup
-        )
 
     async def stats_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Статистика и метрики"""
