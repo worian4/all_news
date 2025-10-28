@@ -36,7 +36,7 @@ cd all_news
 ```
 ### 4. Установка ПО
 Установите Python 3.10+ и установите к нему библиотеки из ```requirements.txt```:
-```pip
+```bash
 pip install -r requirements.txt
 ```
 ### 5. Запуск
