@@ -40,3 +40,4 @@ cd all_news
 pip install -r requirements.txt
 ```
 ### 5. Запуск
+Для запуска достаточно запустить ```bot.py```
